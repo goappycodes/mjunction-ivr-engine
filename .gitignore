@@ -1,0 +1,10 @@
+# Env files
+.env
+.env.local
+supabase/.env.local
+
+# OS / Editor files
+.DS_Store
+.vscode/
+.idea/
+node_modules/
