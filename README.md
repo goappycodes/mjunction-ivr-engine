@@ -7,6 +7,9 @@ Independent Supabase Edge Function for initiating outbound IVR calls via Exotel 
 - `index.ts` - Edge function entry point & request validation
 - `exotel.ts` - Exotel Voice v1 API connect logic
 
+`supabase/functions/exotel-webhook/`
+- `index.ts` - Receives Exotel's call-status/DTMF callbacks. Currently logs the payload and returns `200`; extend this to persist call outcomes.
+
 ## Environment Variables / Secrets
 Configure the following secrets in your Supabase project (or local `supabase/.env.local` for testing):
 - `EXOTEL_API_KEY`

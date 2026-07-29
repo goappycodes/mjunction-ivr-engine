@@ -26,7 +26,12 @@ export async function startExotelCall(
     );
   }
 
-  const endpoint = `https://${subdomain}.api.exotel.com/v1/Accounts/${accountSid}/Calls/connect.json`;
+  // EXOTEL_SUBDOMAIN may be a bare cluster prefix ("api") or a full host
+  // ("api.exotel.com") — accept either so a full host isn't double-appended.
+  const apiHost = subdomain.includes("exotel.com")
+    ? subdomain
+    : `${subdomain}.exotel.com`;
+  const endpoint = `https://${apiHost}/v1/Accounts/${accountSid}/Calls/connect.json`;
   const flowUrl = `http://my.exotel.com/${accountSid}/exoml/start_voice/${appId}`;
 
   const params = new URLSearchParams();
@@ -40,7 +45,7 @@ export async function startExotelCall(
   const response = await fetch(endpoint, {
     method: "POST",
     headers: {
-      "Authorization": authHeader,
+      Authorization: authHeader,
       "Content-Type": "application/x-www-form-urlencoded",
     },
     body: params.toString(),
@@ -67,7 +72,9 @@ export async function startExotelCall(
   const status = callData?.Status ?? "queued";
 
   if (!providerCallRef) {
-    throw new Error(`Exotel API did not return a valid Call Sid: ${responseText}`);
+    throw new Error(
+      `Exotel API did not return a valid Call Sid: ${responseText}`,
+    );
   }
 
   return {
