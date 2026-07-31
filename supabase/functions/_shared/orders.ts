@@ -155,6 +155,8 @@ export interface CallLogEntry {
   step: string;
   userInput?: string;
   status: string;
+  /** Which applet Exotel appears to have called from; recorded for diagnosis. */
+  appletHint?: string;
 }
 
 export async function upsertCallLog(entry: CallLogEntry): Promise<void> {
@@ -178,6 +180,24 @@ export async function upsertCallLog(entry: CallLogEntry): Promise<void> {
 
   if (error) {
     console.error("[upsertCallLog] failed:", error.code, error.message);
+  }
+
+  // Append the step as well. `ivr_logs` keeps only the latest state per call
+  // (unique call_sid + upsert), so the ordered trace lives here.
+  const { error: eventError } = await client.from("ivr_call_events").insert({
+    call_sid: entry.callSid,
+    step: entry.step,
+    user_input: entry.userInput ?? "none",
+    status: entry.status,
+    applet_hint: entry.appletHint ?? null,
+  });
+
+  if (eventError) {
+    console.error(
+      "[upsertCallLog] event insert failed:",
+      eventError.code,
+      eventError.message,
+    );
   }
 }
 

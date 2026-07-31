@@ -71,6 +71,21 @@ function clean(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
 
+/**
+ * Make an order reference readable by the TTS engine.
+ *
+ * "ORDER110121" is otherwise spoken as a single large number
+ * ("order one hundred ten thousand one hundred twenty one"), which no caller can
+ * write down. Separating the digits makes the engine read them individually.
+ */
+function spellReference(ref: string): string {
+  return ref
+    .replace(/([A-Za-z]+)/g, " $1 ")
+    .replace(/(\d)/g, "$1 ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 // ---------------------------------------------------------------------------
 // Request parsing
 // ---------------------------------------------------------------------------
@@ -191,8 +206,8 @@ function welcomePrompt(order: OrderRecord | null): string {
   const item = order.product_name ? ` for ${order.product_name}` : "";
 
   return `${greeting} This is a call from mjunction regarding your order
-    ${order.order_id}${item}. Press 1 to confirm your order. Press 2 if you
-    have any issues.`;
+    ${spellReference(order.order_id)}${item}. Press 1 to confirm your order.
+    Press 2 if you have any issues.`;
 }
 
 function addressPrompt(order: OrderRecord | null): string {
@@ -201,19 +216,17 @@ function addressPrompt(order: OrderRecord | null): string {
       correct. Press 2 if there are any issues.`;
   }
 
-  return `Your order ${order.order_id} will be delivered to
-    ${order.delivery_address}. Press 1 if this address is correct. Press 2 if
-    there are any issues.`;
+  // The order reference is spoken once, in the welcome prompt. Repeating a
+  // digit-by-digit id on every step makes the call tedious to sit through.
+  return `Your order will be delivered to ${order.delivery_address}.
+    Press 1 if this address is correct. Press 2 if there are any issues.`;
 }
 
-function closingPrompt(order: OrderRecord | null, issue: boolean): string {
-  const subject = order ? `Your order ${order.order_id}` : "Your order";
-
+function closingPrompt(_order: OrderRecord | null, issue: boolean): string {
   return issue
-    ? `Thank you. We have noted your issue with ${
-      order ? `order ${order.order_id}` : "your order"
-    } and our team will contact you shortly. Goodbye.`
-    : `Thank you for confirming. ${subject} will be delivered as scheduled.
+    ? `Thank you. We have noted your issue and our team will contact you
+       shortly. Goodbye.`
+    : `Thank you for confirming. Your order will be delivered as scheduled.
        Goodbye.`;
 }
 
@@ -257,13 +270,34 @@ export default {
       // logging with no body is still available via an explicit ?step=passthru.
       const step = stepParam || "welcome";
 
+      // A request with no `step` is almost always a Passthru applet. Passthru
+      // cannot play audio or text to the caller at all — it only passes data and
+      // reads back a status code — so a flow that relies on it for prompts
+      // produces a connected but completely silent call. We still answer with a
+      // valid Gather body (harmless to Passthru, correct for Gather), but the
+      // fact is recorded so a silent call is diagnosable from the logs instead
+      // of looking like a successful prompt.
+      const appletHint = stepParam
+        ? "gather"
+        : `no-step (likely passthru; CallType=${
+          firstOf(params, "CallType") || "?"
+        })`;
+
       const { order, orderId, source } = await resolveOrder(params);
 
       console.log(
-        `[dynamic-greeting] step=${step}${stepParam ? "" : " (defaulted)"} ` +
+        `[dynamic-greeting] step=${step}${stepParam ? "" : " (DEFAULTED)"} ` +
           `callSid=${callSid || "-"} from=${callerNumber || "-"} ` +
           `order=${orderId || "-"} via=${source} digits=${digits || "-"}`,
       );
+
+      if (!stepParam) {
+        console.warn(
+          "[dynamic-greeting] request arrived WITHOUT a step parameter. If this " +
+            "is a Passthru applet it cannot speak, and the caller will hear " +
+            "silence. Point a Gather applet at ?step=welcome instead.",
+        );
+      }
 
       // ------------------------------------------------------------------
       // Explicit Passthru — data-only notification, no audio. Exotel reads
@@ -276,6 +310,7 @@ export default {
           orderId,
           step: "passthru",
           status: "CALL_STARTED",
+          appletHint: "passthru (explicit)",
         });
 
         return new Response(null, {
@@ -294,7 +329,13 @@ export default {
             callerNumber,
             orderId,
             step: "welcome",
-            status: order ? "WELCOME_PLAYED" : "WELCOME_PLAYED_NO_ORDER",
+            // "SERVED" not "PLAYED": we returned a prompt, but whether the
+            // caller actually heard it depends on the applet type, which only
+            // Exotel knows. Claiming PLAYED made silent calls look successful.
+            status: stepParam
+              ? (order ? "WELCOME_SERVED" : "WELCOME_SERVED_NO_ORDER")
+              : "WELCOME_SERVED_NO_STEP",
+            appletHint,
           });
 
           return gather(
@@ -315,7 +356,8 @@ export default {
               ? "ORDER_ISSUE_RAISED"
               : digits === "1"
               ? "ORDER_CONFIRMED"
-              : "ADDRESS_PROMPT_PLAYED",
+              : "ADDRESS_PROMPT_SERVED",
+            appletHint,
           });
 
           return gather(
@@ -337,6 +379,7 @@ export default {
             step: "done",
             userInput: digits,
             status: issue ? "ADDRESS_ISSUE_RAISED" : "ADDRESS_CONFIRMED",
+            appletHint,
           });
 
           return speak(closingPrompt(order, issue));
@@ -353,6 +396,7 @@ export default {
             step,
             userInput: digits,
             status: "UNKNOWN_STEP",
+            appletHint,
           });
 
           return speak("Thank you for calling mjunction. Goodbye.");
