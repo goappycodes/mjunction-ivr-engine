@@ -243,21 +243,33 @@ export default {
       const callSid = firstOf(params, "CallSid", "call_sid");
       const callerNumber = firstOf(params, "CallFrom", "From", "caller_number");
       const digits = readDigits(params);
-      const hasStep = params.has("step");
-      const step = (params.get("step") || "welcome").trim().toLowerCase();
+      const stepParam = (params.get("step") || "").trim().toLowerCase();
+
+      // A missing `step` used to mean "Passthru" and returned an empty body.
+      // That silently produced blank calls: if the bare URL is wired to a
+      // Gather applet (easy to do — Exotel appends its own params, so the
+      // configured URL looks complete without `?step=`), Exotel received zero
+      // bytes where it expected a prompt and the caller heard nothing.
+      //
+      // Defaulting to the welcome prompt is safe for both applet types: a
+      // Gather applet gets the JSON it needs, and Passthru evaluates only the
+      // HTTP status code (200 here) and ignores the body. Pure call-start
+      // logging with no body is still available via an explicit ?step=passthru.
+      const step = stepParam || "welcome";
 
       const { order, orderId, source } = await resolveOrder(params);
 
       console.log(
-        `[dynamic-greeting] step=${hasStep ? step : "passthru"} ` +
+        `[dynamic-greeting] step=${step}${stepParam ? "" : " (defaulted)"} ` +
           `callSid=${callSid || "-"} from=${callerNumber || "-"} ` +
           `order=${orderId || "-"} via=${source} digits=${digits || "-"}`,
       );
 
       // ------------------------------------------------------------------
-      // Passthru — call-start notification. Exotel expects 200, empty body.
+      // Explicit Passthru — data-only notification, no audio. Exotel reads
+      // just the status code here, so the body is deliberately empty.
       // ------------------------------------------------------------------
-      if (!hasStep) {
+      if (step === "passthru") {
         logCallStep({
           callSid,
           callerNumber,
