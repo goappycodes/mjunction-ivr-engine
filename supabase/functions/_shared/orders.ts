@@ -61,10 +61,23 @@ export async function withTimeout<T>(
   }
 }
 
-/** Primary path: the order id travelled with the call via Exotel CustomField. */
-export async function getOrderById(orderId: string): Promise<OrderRecord | null> {
+export interface OrderLookup {
+  order: OrderRecord | null;
+  /** Set only when the query itself failed, never for a simple miss. */
+  error: string | null;
+}
+
+/**
+ * Look up an order, keeping "does not exist" distinguishable from "the query
+ * failed". Callers that must report the real fault (ivr-engine) use this;
+ * callers that must never drop a live call (dynamic-greeting) use
+ * `getOrderById`, which collapses both cases to null on purpose.
+ */
+export async function lookupOrderById(orderId: string): Promise<OrderLookup> {
   const client = db();
-  if (!client) return null;
+  if (!client) {
+    return { order: null, error: "No Supabase key configured" };
+  }
 
   const { data, error } = await client
     .from("orders")
@@ -73,10 +86,17 @@ export async function getOrderById(orderId: string): Promise<OrderRecord | null>
     .maybeSingle();
 
   if (error) {
-    console.error("[getOrderById] failed:", error.code, error.message);
-    return null;
+    console.error("[lookupOrderById] failed:", error.code, error.message);
+    return { order: null, error: `${error.code}: ${error.message}` };
   }
-  return (data as OrderRecord | null) ?? null;
+
+  return { order: (data as OrderRecord | null) ?? null, error: null };
+}
+
+/** Primary path: the order id travelled with the call via Exotel CustomField. */
+export async function getOrderById(orderId: string): Promise<OrderRecord | null> {
+  const { order } = await lookupOrderById(orderId);
+  return order;
 }
 
 /**

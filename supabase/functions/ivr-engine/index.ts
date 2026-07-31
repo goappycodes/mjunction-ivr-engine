@@ -1,6 +1,6 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { startExotelCall, type ExotelCallRequest } from "./exotel.ts";
-import { getOrderById, upsertCallLog } from "../_shared/orders.ts";
+import { lookupOrderById, upsertCallLog } from "../_shared/orders.ts";
 
 const JSON_HEADERS = {
   "Content-Type": "application/json",
@@ -51,12 +51,23 @@ export default {
       // The order is the source of truth for the whole flow, so resolve it up
       // front. `phoneNumber` is optional: when omitted we dial the number on the
       // order record, which is the normal case for an outbound campaign.
-      const order = await getOrderById(orderId);
-      if (!order) {
+      const { order, error: lookupError } = await lookupOrderById(orderId);
+
+      // A failed query must not masquerade as a missing order — that made a
+      // permission or schema fault look identical to a typo in the order id.
+      if (lookupError) {
         return json(
-          { success: false, error: `Unknown orderId: ${orderId}` },
-          404,
+          { success: false, error: `Order lookup failed: ${lookupError}` },
+          502,
         );
+      }
+
+      if (!order) {
+        return json({
+          success: false,
+          error: `Unknown orderId: ${orderId}`,
+          hint: "No row in public.orders with this order_id",
+        }, 404);
       }
 
       const phoneNumber = body.phoneNumber?.trim() || order.phone_number;

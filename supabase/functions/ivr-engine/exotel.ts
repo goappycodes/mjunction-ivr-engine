@@ -128,11 +128,21 @@ export async function startExotelCall(
 
   if (!response.ok) {
     const restException = parsedJson?.RestException as
-      | { Message?: string }
+      | { Message?: string; Code?: number; Status?: number }
       | undefined;
+
+    // Attribute the failure to Exotel explicitly. Passing Exotel's bare message
+    // through made an Exotel credential rejection ("Unauthorized; ", code
+    // 34010) look like a Supabase authorization problem.
+    const detail = restException?.Message?.trim().replace(/;$/, "") ??
+      responseText.slice(0, 200);
+    const code = restException?.Code ? `, code ${restException.Code}` : "";
+
     throw new Error(
-      restException?.Message ??
-        `Exotel API call failed with HTTP status ${response.status}`,
+      `Exotel rejected the request (HTTP ${response.status}${code}): ${detail}` +
+        (response.status === 401
+          ? " — check the EXOTEL_API_KEY / EXOTEL_API_TOKEN / EXOTEL_ACCOUNT_SID secrets"
+          : ""),
     );
   }
 
