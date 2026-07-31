@@ -10,6 +10,27 @@ export interface ExotelCallResponse {
   raw: unknown;
 }
 
+/**
+ * Normalises EXOTEL_SUBDOMAIN into a hostname.
+ *
+ * The previous template was `https://${subdomain}.api.exotel.com`, which is
+ * wrong for every documented value: the configured `api.in.exotel.com` became
+ * `api.in.exotel.com.api.exotel.com`, and the README's `api` became
+ * `api.api.exotel.com`. Exotel's real hosts are `api.exotel.com` (Singapore)
+ * and `api.in.exotel.com` (India), so accept either a full host or a bare
+ * subdomain.
+ */
+export function resolveExotelHost(subdomain: string): string {
+  const host = subdomain
+    .trim()
+    .replace(/^https?:\/\//, "")
+    .replace(/\/+$/, "");
+
+  if (host.endsWith("exotel.com")) return host;   // api.in.exotel.com
+  if (host.endsWith(".exotel")) return `${host}.com`; // in.exotel
+  return `${host}.exotel.com`;                     // api
+}
+
 export async function startExotelCall(
   request: ExotelCallRequest,
 ): Promise<ExotelCallResponse> {
@@ -26,8 +47,9 @@ export async function startExotelCall(
     );
   }
 
-  const endpoint = `https://${subdomain}.api.exotel.com/v1/Accounts/${accountSid}/Calls/connect.json`;
-  const flowUrl = `http://my.exotel.com/${accountSid}/exoml/start_voice/${appId}`;
+  const host = resolveExotelHost(subdomain);
+  const endpoint = `https://${host}/v1/Accounts/${accountSid}/Calls/connect.json`;
+  const flowUrl = `https://my.exotel.com/${accountSid}/exoml/start_voice/${appId}`;
 
   const params = new URLSearchParams();
   params.append("From", request.phoneNumber);
