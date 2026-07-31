@@ -1,26 +1,12 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-
-const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "http://127.0.0.1:54321";
-// Server-to-server webhook: there is no end-user session to act on behalf of,
-// so use the service-role key. The anon key would be subject to RLS and every
-// read/write here would silently return zero rows.
-const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ??
-  Deno.env.get("SUPABASE_ANON_KEY") ?? "";
-
-// createClient throws if the key is empty. At module scope that would make the
-// worker fail to boot and Exotel would see a 500 before any handler ran, so the
-// client is created lazily and a missing key degrades to "no logging" instead
-// of killing the call.
-let cachedClient: ReturnType<typeof createClient> | null = null;
-function db() {
-  if (!supabaseKey) return null;
-  if (!cachedClient) cachedClient = createClient(supabaseUrl, supabaseKey);
-  return cachedClient;
-}
-
-const FALLBACK_ORDER_ID = "ORD12345";
-const FALLBACK_FROM = "08116411177";
+import {
+  getOrderByPhone,
+  getOrderById,
+  getOrderIdByCallSid,
+  logCallStep,
+  type OrderRecord,
+  withTimeout,
+} from "../_shared/orders.ts";
 
 const JSON_HEADERS = {
   "Content-Type": "application/json",
@@ -28,52 +14,71 @@ const JSON_HEADERS = {
   "Cache-Control": "no-store",
 };
 
-/**
- * Exotel's dynamic Gather applet terminates the call unless it receives
- * HTTP 200 with a well-formed JSON body. Every response on the IVR path must
- * go through here — never a bare 404/500.
- */
-function gather(
-  text: string,
-  opts: { repeatText?: string; maxDigits?: number } = {},
-) {
+// ---------------------------------------------------------------------------
+// Exotel Gather applet response contract
+//
+// Documented schema:
+//   gather_prompt          object   REQUIRED  { text } or { audio_url }
+//   max_input_digits       int      optional  default 255
+//   finish_on_key          string   optional  default "#"; "" means no finish key
+//   input_timeout          int      optional  default 5 (seconds between keys)
+//   repeat_menu            int      optional  default 0
+//   repeat_gather_prompt   object   optional  defaults to gather_prompt
+//
+// Must be HTTP 200 with Content-Type: application/json. Anything else — a 404, a
+// non-JSON body, or no reply within 5 seconds — makes Exotel abandon the applet
+// and drop the caller. Every response below therefore goes through gather() or
+// speak(); no code path may return a bare error to Exotel.
+// ---------------------------------------------------------------------------
+
+function gather(text: string, repeatText?: string) {
   const body: Record<string, unknown> = {
-    gather_prompt: { text },
-    max_input_digits: opts.maxDigits ?? 1,
+    gather_prompt: { text: clean(text) },
+    // Both of these are sent explicitly because Exotel's defaults (255 digits
+    // and "#") are wrong for a single-digit menu. An empty finish_on_key is
+    // valid and documented as "no finish key".
+    max_input_digits: 1,
+    finish_on_key: "",
     input_timeout: 5,
   };
 
-  // `finish_on_key` must be an actual DTMF key. The previous empty string was
-  // not a valid value, so it is omitted unless there is something to send.
-  if (opts.repeatText) {
+  if (repeatText) {
     body.repeat_menu = 1;
-    body.repeat_gather_prompt = { text: opts.repeatText };
+    body.repeat_gather_prompt = { text: clean(repeatText) };
   }
 
   return Response.json(body, { status: 200, headers: JSON_HEADERS });
 }
 
 /**
- * Terminal message: plays text and lets the flow move on.
- *
- * Deliberately reuses the same field shape as `gather()` (which Exotel is
- * already known to accept on the welcome/address prompts) rather than sending
- * `max_input_digits: 0`, which is not verified against the Exotel applet spec.
- * The short timeout keeps the trailing dead air minimal.
+ * Closing message. Still a Gather payload, because these steps are wired to
+ * Gather applets — a Greeting applet expects a different body entirely
+ * (`{"greeting_url": ...}` or text/plain). Gather has no documented play-only
+ * mode, so a digit is nominally collected and discarded; the short timeout keeps
+ * the trailing dead air down.
  */
 function speak(text: string) {
-  return Response.json(
-    { gather_prompt: { text }, max_input_digits: 1, input_timeout: 3 },
-    { status: 200, headers: JSON_HEADERS },
-  );
+  return Response.json({
+    gather_prompt: { text: clean(text) },
+    max_input_digits: 1,
+    finish_on_key: "",
+    input_timeout: 2,
+  }, { status: 200, headers: JSON_HEADERS });
 }
 
+/** Collapse whitespace so the TTS engine gets a clean single-line prompt. */
+function clean(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+// ---------------------------------------------------------------------------
+// Request parsing
+// ---------------------------------------------------------------------------
+
 /**
- * Exotel sends applet parameters as a query string on GET (Passthru and
- * dynamic Gather) but as a form-encoded body on POST. The previous version
- * only read the body, so on Exotel's GET requests CallSid was always absent
- * and got replaced by a synthetic `call_<timestamp>` — which meant the later
- * `.update().eq("call_sid", ...)` never matched the row it had just written.
+ * Exotel sends applet parameters as a query string on GET. POST bodies are also
+ * accepted so the endpoint stays testable and tolerant of Passthru
+ * configuration, but query params always win.
  */
 async function readParams(req: Request, url: URL): Promise<URLSearchParams> {
   const params = new URLSearchParams(url.searchParams);
@@ -104,87 +109,122 @@ async function readParams(req: Request, url: URL): Promise<URLSearchParams> {
 function firstOf(params: URLSearchParams, ...keys: string[]): string {
   for (const key of keys) {
     const value = params.get(key);
-    if (value) return value;
+    if (value) return value.trim();
   }
   return "";
 }
 
-/** Exotel wraps collected DTMF in quotes on some flows, e.g. `"1"`. */
+/**
+ * Exotel documents that `digits` arrives wrapped in double quotes and must be
+ * trimmed, e.g. `"1"`.
+ */
 function readDigits(params: URLSearchParams): string {
-  const raw = firstOf(params, "digits", "Digits", "dtmf", "DTMF", "gather_input");
-  return raw.replace(/["\s]/g, "");
+  return firstOf(params, "digits", "Digits", "dtmf", "DTMF")
+    .replace(/["\s]/g, "");
 }
+
+// ---------------------------------------------------------------------------
+// Order resolution
+// ---------------------------------------------------------------------------
 
 /**
- * Callers arrive as `08116411177`, `8116411177` or `+918116411177` depending on
- * the circuit. Match on the last 10 digits so the order lookup actually hits
- * instead of always falling through to the hardcoded id.
+ * Resolve the order this call is about, in order of reliability:
+ *
+ *   1. `CustomField` — the order id ivr-engine passed to Calls/connect. Exotel
+ *      echoes it to every applet, so this is the normal path.
+ *   2. `CallSid` — ivr-engine also stored the mapping when it placed the call,
+ *      which covers any applet request that arrives without CustomField.
+ *   3. Caller number — the only option for an inbound call, which never has a
+ *      CustomField.
+ *
+ * The whole chain is capped at DB_TIMEOUT_MS so a slow database degrades to a
+ * generic prompt instead of a dropped call.
  */
-async function lookupOrderId(phone: string): Promise<string> {
-  const client = db();
-  if (!client) {
-    console.warn("[lookupOrderId] no Supabase key configured; using fallback");
-    return FALLBACK_ORDER_ID;
-  }
+async function resolveOrder(
+  params: URLSearchParams,
+): Promise<{ order: OrderRecord | null; orderId: string; source: string }> {
+  const customField = firstOf(params, "CustomField", "custom_field");
+  const callSid = firstOf(params, "CallSid", "call_sid");
+  const from = firstOf(params, "CallFrom", "From", "caller_number");
 
-  const national = phone.replace(/\D/g, "").slice(-10);
+  const resolved = await withTimeout(
+    (async () => {
+      if (customField) {
+        const order = await getOrderById(customField);
+        if (order) return { order, orderId: order.order_id, source: "CustomField" };
+        console.warn(`[resolveOrder] CustomField "${customField}" matched no order`);
+      }
 
-  const { data, error } = await client
-    .from("orders")
-    .select("order_id")
-    // PostgREST uses `*` as the LIKE wildcard in filter strings, not `%`.
-    .or(`phone_number.eq.${phone},phone_number.like.*${national}`)
-    .limit(1)
-    .maybeSingle();
+      if (callSid) {
+        const mapped = await getOrderIdByCallSid(callSid);
+        if (mapped) {
+          const order = await getOrderById(mapped);
+          if (order) return { order, orderId: order.order_id, source: "CallSid" };
+        }
+      }
 
-  // Errors are logged but never thrown: a DB problem must not drop the call.
-  if (error) {
-    console.error("[lookupOrderId] failed:", error.code, error.message);
-    return FALLBACK_ORDER_ID;
-  }
+      if (from) {
+        const order = await getOrderByPhone(from);
+        if (order) return { order, orderId: order.order_id, source: "CallFrom" };
+      }
 
-  if (!data?.order_id) {
-    console.warn(`[lookupOrderId] no order for ${phone} (national=${national})`);
-    return FALLBACK_ORDER_ID;
-  }
+      return { order: null, orderId: customField, source: "unresolved" };
+    })(),
+    { order: null, orderId: customField, source: "timeout" },
+    "resolveOrder",
+  );
 
-  return data.order_id;
+  return resolved;
 }
 
-async function logStep(entry: {
-  callSid: string;
-  callerNumber?: string;
-  orderId?: string;
-  step: string;
-  userInput?: string;
-  status: string;
-}) {
-  const client = db();
-  if (!client || !entry.callSid) return;
+// ---------------------------------------------------------------------------
+// Prompt construction — every prompt is built from the resolved order
+// ---------------------------------------------------------------------------
 
-  const { error } = await client.from("ivr_logs").upsert({
-    call_sid: entry.callSid,
-    caller_number: entry.callerNumber,
-    order_id: entry.orderId,
-    step: entry.step,
-    user_input: entry.userInput ?? "none",
-    status: entry.status,
-    updated_at: new Date().toISOString(),
-  }, { onConflict: "call_sid" });
-
-  if (error) {
-    console.error("[logStep] failed:", error.code, error.message);
+function welcomePrompt(order: OrderRecord | null): string {
+  if (!order) {
+    return `Welcome to mjunction. We are calling regarding your recent order.
+      Press 1 to confirm your order. Press 2 if you have any issues.`;
   }
+
+  const greeting = order.customer_name ? `Hello ${order.customer_name}.` : "Hello.";
+  const item = order.product_name ? ` for ${order.product_name}` : "";
+
+  return `${greeting} This is a call from mjunction regarding your order
+    ${order.order_id}${item}. Press 1 to confirm your order. Press 2 if you
+    have any issues.`;
 }
+
+function addressPrompt(order: OrderRecord | null): string {
+  if (!order?.delivery_address) {
+    return `Please confirm your delivery address. Press 1 if your address is
+      correct. Press 2 if there are any issues.`;
+  }
+
+  return `Your order ${order.order_id} will be delivered to
+    ${order.delivery_address}. Press 1 if this address is correct. Press 2 if
+    there are any issues.`;
+}
+
+function closingPrompt(order: OrderRecord | null, issue: boolean): string {
+  const subject = order ? `Your order ${order.order_id}` : "Your order";
+
+  return issue
+    ? `Thank you. We have noted your issue with ${
+      order ? `order ${order.order_id}` : "your order"
+    } and our team will contact you shortly. Goodbye.`
+    : `Thank you for confirming. ${subject} will be delivered as scheduled.
+       Goodbye.`;
+}
+
+// ---------------------------------------------------------------------------
 
 export default {
   fetch: async (req: Request) => {
     const url = new URL(req.url);
-    let isIvrPath = false;
+    const isIvrPath = url.pathname.includes("/dynamic-greeting");
 
     try {
-      isIvrPath = url.pathname.includes("/dynamic-greeting");
-
       if (req.method === "OPTIONS") {
         return new Response(null, {
           headers: {
@@ -201,29 +241,26 @@ export default {
 
       const params = await readParams(req, url);
       const callSid = firstOf(params, "CallSid", "call_sid");
-      const fromNumber = firstOf(
-        params,
-        "From",
-        "CallFrom",
-        "caller_number",
-      ) || FALLBACK_FROM;
+      const callerNumber = firstOf(params, "CallFrom", "From", "caller_number");
       const digits = readDigits(params);
       const hasStep = params.has("step");
-      const step = (params.get("step") || "welcome").toLowerCase();
+      const step = (params.get("step") || "welcome").trim().toLowerCase();
 
-      // --------------------------------------------------------------------
-      // 1. PASSTHRU — call start notification. Exotel expects 200 + no body.
-      // --------------------------------------------------------------------
+      const { order, orderId, source } = await resolveOrder(params);
+
+      console.log(
+        `[dynamic-greeting] step=${hasStep ? step : "passthru"} ` +
+          `callSid=${callSid || "-"} from=${callerNumber || "-"} ` +
+          `order=${orderId || "-"} via=${source} digits=${digits || "-"}`,
+      );
+
+      // ------------------------------------------------------------------
+      // Passthru — call-start notification. Exotel expects 200, empty body.
+      // ------------------------------------------------------------------
       if (!hasStep) {
-        const callStatus = firstOf(params, "CallStatus") || "incoming";
-        console.log(
-          `[Passthru] CallSid=${callSid} From=${fromNumber} Status=${callStatus}`,
-        );
-
-        const orderId = await lookupOrderId(fromNumber);
-        await logStep({
+        logCallStep({
           callSid,
-          callerNumber: fromNumber,
+          callerNumber,
           orderId,
           step: "passthru",
           status: "CALL_STARTED",
@@ -235,39 +272,30 @@ export default {
         });
       }
 
-      // --------------------------------------------------------------------
-      // 2. DYNAMIC GATHER — must always answer 200 + JSON.
-      // --------------------------------------------------------------------
-      console.log(
-        `[Gather] step=${step} CallSid=${callSid} From=${fromNumber} digits=${digits || "-"}`,
-      );
-
-      const orderId = await lookupOrderId(fromNumber);
-
+      // ------------------------------------------------------------------
+      // Gather applets — always 200 + JSON.
+      // ------------------------------------------------------------------
       switch (step) {
-        case "welcome": {
-          await logStep({
+        case "welcome":
+          logCallStep({
             callSid,
-            callerNumber: fromNumber,
+            callerNumber,
             orderId,
             step: "welcome",
-            status: "WELCOME_PLAYED",
+            status: order ? "WELCOME_PLAYED" : "WELCOME_PLAYED_NO_ORDER",
           });
 
           return gather(
-            `Welcome to mjunction. We are calling regarding your order number ${orderId}. Press 1 to confirm your order. Press 2 if you have any issues.`,
-            {
-              repeatText:
-                "Sorry, I didn't receive your input. Please press 1 to confirm your order or press 2 if you have any issues.",
-            },
+            welcomePrompt(order),
+            `Sorry, I didn't receive your input. Press 1 to confirm your order
+             or press 2 if you have any issues.`,
           );
-        }
 
-        case "address": {
-          // Digits collected on the welcome menu arrive with this request.
-          await logStep({
+        case "address":
+          // The digit pressed on the welcome menu arrives with this request.
+          logCallStep({
             callSid,
-            callerNumber: fromNumber,
+            callerNumber,
             orderId,
             step: "address",
             userInput: digits,
@@ -279,48 +307,36 @@ export default {
           });
 
           return gather(
-            "Please confirm your delivery address. Press 1 if your address is correct. Press 2 if there are any issues.",
-            {
-              repeatText:
-                "Sorry, I didn't receive your input. Please press 1 if your address is correct or press 2 if there are any issues.",
-            },
+            addressPrompt(order),
+            `Sorry, I didn't receive your input. Press 1 if your address is
+             correct or press 2 if there are any issues.`,
           );
-        }
 
-        // ------------------------------------------------------------------
-        // Terminal step. This is the one that was missing: after the caller
-        // pressed a key on the address menu, Exotel requested a follow-up
-        // step, the switch had no branch for it, and the function answered
-        // 404 text/plain — so Exotel hung up mid-call.
-        // ------------------------------------------------------------------
         case "done":
         case "goodbye":
         case "confirm":
         case "issue": {
           const issue = digits === "2" || step === "issue";
-          await logStep({
+
+          logCallStep({
             callSid,
-            callerNumber: fromNumber,
+            callerNumber,
             orderId,
             step: "done",
             userInput: digits,
             status: issue ? "ADDRESS_ISSUE_RAISED" : "ADDRESS_CONFIRMED",
           });
 
-          return speak(
-            issue
-              ? "Thank you. We have noted your issue and our team will contact you shortly. Goodbye."
-              : "Thank you for confirming. Your order will be delivered as scheduled. Goodbye.",
-          );
+          return speak(closingPrompt(order, issue));
         }
 
-        default: {
-          // Unknown step: still answer 200 + JSON so the call ends cleanly
-          // rather than being cut off by Exotel.
-          console.warn(`[Gather] unknown step "${step}" — playing fallback`);
-          await logStep({
+        default:
+          // Unknown step still answers 200 + JSON so the call ends cleanly
+          // instead of being cut off by Exotel.
+          console.warn(`[dynamic-greeting] unknown step "${step}"`);
+          logCallStep({
             callSid,
-            callerNumber: fromNumber,
+            callerNumber,
             orderId,
             step,
             userInput: digits,
@@ -328,15 +344,16 @@ export default {
           });
 
           return speak("Thank you for calling mjunction. Goodbye.");
-        }
       }
     } catch (err) {
       console.error("Error in dynamic-greeting:", err);
 
-      // Only IVR traffic gets the spoken fallback; anything else gets a real
-      // error so genuine bugs stay visible to callers of the HTTP API.
+      // Exotel must still get a valid Gather body; anything else surfaces a real
+      // error so genuine bugs stay visible to non-IVR callers.
       if (isIvrPath) {
-        return speak("Sorry, we are unable to process your call right now. Goodbye.");
+        return speak(
+          "Sorry, we are unable to process your call right now. Goodbye.",
+        );
       }
       return Response.json({ error: "Internal Server Error" }, { status: 500 });
     }

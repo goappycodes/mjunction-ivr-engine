@@ -1,7 +1,21 @@
+/**
+ * Exotel Voice v1 — "connect a number to a call flow".
+ *
+ * POST https://<host>/v1/Accounts/<sid>/Calls/connect.json
+ * Basic auth with <api_key>:<api_token>.
+ *
+ * Required: From, CallerId, Url
+ * Optional: CallType, TimeLimit, TimeOut, StatusCallback, StatusCallbackEvents,
+ *           CustomField, Record
+ */
+
 export interface ExotelCallRequest {
   phoneNumber: string;
+  /** Travels with the call as CustomField and is echoed back to every applet. */
   orderId: string;
   language?: string;
+  statusCallbackUrl?: string;
+  record?: boolean;
 }
 
 export interface ExotelCallResponse {
@@ -10,15 +24,23 @@ export interface ExotelCallResponse {
   raw: unknown;
 }
 
+/** Documented Call.Status values for this endpoint. */
+export const CALL_STATUSES = [
+  "queued",
+  "in-progress",
+  "completed",
+  "failed",
+  "busy",
+  "no-answer",
+] as const;
+
 /**
  * Normalises EXOTEL_SUBDOMAIN into a hostname.
  *
- * The previous template was `https://${subdomain}.api.exotel.com`, which is
- * wrong for every documented value: the configured `api.in.exotel.com` became
- * `api.in.exotel.com.api.exotel.com`, and the README's `api` became
- * `api.api.exotel.com`. Exotel's real hosts are `api.exotel.com` (Singapore)
- * and `api.in.exotel.com` (India), so accept either a full host or a bare
- * subdomain.
+ * The documented hosts are `api.in.exotel.com` (India/Mumbai) and
+ * `api.exotel.com` (Singapore). The original template was
+ * `https://${subdomain}.api.exotel.com`, which mangled every valid value: the
+ * configured `api.in.exotel.com` became `api.in.exotel.com.api.exotel.com`.
  */
 export function resolveExotelHost(subdomain: string): string {
   const host = subdomain
@@ -26,9 +48,9 @@ export function resolveExotelHost(subdomain: string): string {
     .replace(/^https?:\/\//, "")
     .replace(/\/+$/, "");
 
-  if (host.endsWith("exotel.com")) return host;   // api.in.exotel.com
+  if (host.endsWith("exotel.com")) return host;      // api.in.exotel.com
   if (host.endsWith(".exotel")) return `${host}.com`; // in.exotel
-  return `${host}.exotel.com`;                     // api
+  return `${host}.exotel.com`;                        // api
 }
 
 export async function startExotelCall(
@@ -39,23 +61,48 @@ export async function startExotelCall(
   const accountSid = Deno.env.get("EXOTEL_ACCOUNT_SID");
   const subdomain = Deno.env.get("EXOTEL_SUBDOMAIN");
   const callerId = Deno.env.get("EXOTEL_CALLER_ID");
-  const appId = Deno.env.get("EXOTEL_APP_ID") ?? "1301090";
+  const appId = Deno.env.get("EXOTEL_APP_ID");
 
-  if (!apiKey || !apiToken || !accountSid || !subdomain || !callerId) {
+  const missing = [
+    ["EXOTEL_API_KEY", apiKey],
+    ["EXOTEL_API_TOKEN", apiToken],
+    ["EXOTEL_ACCOUNT_SID", accountSid],
+    ["EXOTEL_SUBDOMAIN", subdomain],
+    ["EXOTEL_CALLER_ID", callerId],
+    ["EXOTEL_APP_ID", appId],
+  ].filter(([, v]) => !v).map(([k]) => k);
+
+  if (missing.length) {
     throw new Error(
-      "Missing required Exotel environment variables (EXOTEL_API_KEY, EXOTEL_API_TOKEN, EXOTEL_ACCOUNT_SID, EXOTEL_SUBDOMAIN, EXOTEL_CALLER_ID)",
+      `Missing required Exotel environment variables: ${missing.join(", ")}`,
     );
   }
 
-  const host = resolveExotelHost(subdomain);
+  const host = resolveExotelHost(subdomain!);
   const endpoint = `https://${host}/v1/Accounts/${accountSid}/Calls/connect.json`;
-  const flowUrl = `https://my.exotel.com/${accountSid}/exoml/start_voice/${appId}`;
+
+  // Documented flow URL format. Kept as http:// deliberately — this is the exact
+  // form Exotel documents for the Url parameter, and it is dereferenced inside
+  // Exotel rather than fetched by us.
+  const flowUrl =
+    `http://my.exotel.com/${accountSid}/exoml/start_voice/${appId}`;
 
   const params = new URLSearchParams();
   params.append("From", request.phoneNumber);
-  params.append("CallerId", callerId);
+  params.append("CallerId", callerId!);
   params.append("Url", flowUrl);
+  // The order id rides along here and Exotel echoes it back as `CustomField` on
+  // every applet request, which is how dynamic-greeting knows which order to
+  // build the prompt from.
   params.append("CustomField", request.orderId);
+  // Order-confirmation calls are transactional, which is what `trans` declares.
+  params.append("CallType", "trans");
+  params.append("Record", String(request.record ?? false));
+
+  if (request.statusCallbackUrl) {
+    params.append("StatusCallback", request.statusCallbackUrl);
+    params.append("StatusCallbackEvents[0]", "terminal");
+  }
 
   const authHeader = `Basic ${btoa(`${apiKey}:${apiToken}`)}`;
 
@@ -69,32 +116,38 @@ export async function startExotelCall(
   });
 
   const responseText = await response.text();
-  let parsedJson: Record<string, any>;
+  let parsedJson: Record<string, unknown>;
 
   try {
     parsedJson = JSON.parse(responseText);
   } catch (_e) {
-    throw new Error(`Failed to parse Exotel API response: ${responseText}`);
+    throw new Error(
+      `Failed to parse Exotel API response (HTTP ${response.status}): ${responseText}`,
+    );
   }
 
   if (!response.ok) {
-    const errorMessage =
-      parsedJson?.RestException?.Message ??
-      `Exotel API call failed with HTTP status ${response.status}`;
-    throw new Error(errorMessage);
+    const restException = parsedJson?.RestException as
+      | { Message?: string }
+      | undefined;
+    throw new Error(
+      restException?.Message ??
+        `Exotel API call failed with HTTP status ${response.status}`,
+    );
   }
 
-  const callData = parsedJson?.Call ?? {};
-  const providerCallRef = callData?.Sid ?? "";
-  const status = callData?.Status ?? "queued";
+  const callData = (parsedJson?.Call ?? {}) as { Sid?: string; Status?: string };
+  const providerCallRef = callData.Sid ?? "";
 
   if (!providerCallRef) {
-    throw new Error(`Exotel API did not return a valid Call Sid: ${responseText}`);
+    throw new Error(`Exotel API did not return a Call Sid: ${responseText}`);
   }
 
+  // A 200 confirms Exotel accepted the request, not that the call connected —
+  // the real outcome arrives via StatusCallback or the Call Details API.
   return {
     providerCallRef,
-    status,
+    status: callData.Status ?? "queued",
     raw: parsedJson,
   };
 }
