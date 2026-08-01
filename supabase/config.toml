@@ -382,8 +382,18 @@ inspector_port = 8083
 # The Deno major version to use.
 deno_version = 2
 
-# [edge_runtime.secrets]
-# secret_key = "env(SECRET_VALUE)"
+# Secrets exposed to edge functions locally. Values are interpolated from
+# supabase/.env.local. Without this block the EXOTEL_* variables were absent
+# from the edge runtime and ivr-engine threw "Missing required Exotel
+# environment variables". The SUPABASE_* variables are injected automatically
+# and must not be redeclared here.
+[edge_runtime.secrets]
+EXOTEL_API_KEY = "env(EXOTEL_API_KEY)"
+EXOTEL_API_TOKEN = "env(EXOTEL_API_TOKEN)"
+EXOTEL_ACCOUNT_SID = "env(EXOTEL_ACCOUNT_SID)"
+EXOTEL_SUBDOMAIN = "env(EXOTEL_SUBDOMAIN)"
+EXOTEL_CALLER_ID = "env(EXOTEL_CALLER_ID)"
+EXOTEL_APP_ID = "env(EXOTEL_APP_ID)"
 
 [analytics]
 enabled = true
