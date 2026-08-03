@@ -12,8 +12,13 @@ Exotel Voice v1 API and for serving the dynamic call flow.
 `supabase/functions/dynamic-greeting/` — serves the live call flow to Exotel
 - `index.ts` - Passthru (call-start) + dynamic Gather endpoints
 
+`supabase/functions/ivr-status-callback/` — receives Exotel's call-status webhook
+- `index.ts` - records every telephony status event Exotel sends for a call
+
 `supabase/functions/_shared/`
-- `orders.ts` - order lookups, call logging, timeout guard (used by both)
+- `orders.ts` - order lookups, call logging, status-callback recording, timeout guard
+- `params.ts` - Exotel request-parameter parsing, shared by `dynamic-greeting` and `ivr-status-callback`
+- `callState.ts` - the two call-state enums (see "Call state flow" below)
 
 ## How the order id flows through the call
 
@@ -72,6 +77,67 @@ accepted the request, not that the call connected — the outcome arrives via
 Errors: 400 missing `orderId`, 404 unknown `orderId`, 422 no phone number
 available, 405 wrong method, 503 Exotel env vars missing, 502 Exotel rejected it.
 
+`statusCallbackUrl` defaults to `IVR_STATUS_CALLBACK_URL` (see below) when the
+caller does not pass one, so every call gets its telephony outcome recorded
+without remembering to wire it manually each time.
+
+## POST/GET /ivr-status-callback (Exotel StatusCallback receiver)
+
+Not called by your application — Exotel calls this. `ivr-engine` passes its URL
+as the `StatusCallback` parameter on `Calls/connect`, subscribed to the
+`terminal` event, so Exotel POSTs here once a call ends: `completed`, `failed`,
+`busy`, or `no-answer`.
+
+This endpoint has one job: capture every param Exotel sends and update the
+call's telephony status. It plays no audio and is unrelated to the Gather flow
+in `dynamic-greeting` — that flow tracks how far the *caller* got in the
+conversation; this tracks what the *call itself* ended up doing.
+
+Every request is recorded twice:
+- `ivr_logs.call_status` / `ivr_logs.ended_at` — the latest known outcome for
+  that `CallSid`, alongside the existing conversational `status`/`step` columns.
+- `ivr_status_events` — an append-only row per callback, with the entire raw
+  payload in `raw` (jsonb), so a status Exotel sends that isn't recognised yet
+  is still captured instead of silently dropped.
+
+Always responds `200` with an empty body — Exotel only checks the status code
+here, and a DB fault must not make Exotel retry a call that has already ended.
+
+## Call state flow
+
+Two independent states are tracked per call (`supabase/functions/_shared/callState.ts`):
+
+**`ivr_logs.status`** — the conversational state, i.e. how far the caller got
+in the menu. Set by `dynamic-greeting` on every applet request:
+
+```
+CALL_STARTED
+  -> WELCOME_SERVED (or _NO_ORDER / _NO_STEP)
+       -> ORDER_CONFIRMED  (digit 1 on the welcome menu)
+       -> ORDER_ISSUE_RAISED (digit 2 on the welcome menu)
+            -> ADDRESS_PROMPT_SERVED
+                 -> ADDRESS_CONFIRMED (digit 1 on the address menu)
+                 -> ADDRESS_ISSUE_RAISED (digit 2 on the address menu)
+UNKNOWN_STEP  (any unrecognised `step` param, at any point)
+```
+
+**`ivr_logs.call_status`** — Exotel's telephony outcome for the call itself.
+Set to `queued` by `ivr-engine` when the call is placed, and finalized by
+`ivr-status-callback` to one of: `ringing`, `in-progress`, `completed`,
+`failed`, `busy`, `no-answer`.
+
+They are kept separate rather than merged into one flow because they can
+diverge — a call can reach `ADDRESS_CONFIRMED` and still end up `failed` if the
+line drops before the closing message, or Exotel can report `completed` for a
+call that never answered a single Gather prompt. Query both columns together
+(`select status, call_status from ivr_logs where call_sid = ...`) to get the
+full picture of where a given call actually ended up.
+
+To add a new conversational state: extend `IVR_STATES` in `callState.ts` and
+the corresponding `case` in `dynamic-greeting/index.ts`'s switch. Nothing else
+needs to change — `ivr-status-callback` and the telephony `call_status` track
+are independent of it.
+
 ## Database prerequisites
 
 `dynamic-greeting` reads `orders` and writes `ivr_logs`. Both are created by
@@ -90,8 +156,8 @@ greeting announces the hardcoded fallback order id, and nothing is logged.
 
 ## Environment Variables / Secrets
 
-`dynamic-greeting` needs only the auto-injected `SUPABASE_URL` and
-`SUPABASE_SERVICE_ROLE_KEY` — do not declare these yourself.
+`dynamic-greeting` and `ivr-status-callback` need only the auto-injected
+`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` — do not declare these yourself.
 
 `ivr-engine` needs the following, kept in `supabase/.env.local` (gitignored)
 and surfaced to the local edge runtime by the `[edge_runtime.secrets]` block in
@@ -103,6 +169,10 @@ and surfaced to the local edge runtime by the `[edge_runtime.secrets]` block in
   `api.exotel.com` for Singapore) or a bare subdomain
 - `EXOTEL_CALLER_ID`
 - `EXOTEL_APP_ID`
+- `IVR_STATUS_CALLBACK_URL` — deployed URL of `ivr-status-callback`
+  (`<FUNCTIONS_URL>/ivr-status-callback`), used as the default `StatusCallback`
+  for every call. Optional locally (Exotel cannot reach a `127.0.0.1` URL
+  anyway); required once deployed if you want call outcomes recorded.
 
 `supabase start` has no `--env-file` flag — `env(...)` in `config.toml` is
 resolved from the **process environment**, so the file must be exported into the
@@ -143,6 +213,11 @@ which is why `step=address` records the answer to the order question, and
 
 Any unrecognised `step` now returns a valid closing message rather than a 404.
 
+`ivr-status-callback` is **not** one of these applet nodes — Exotel calls it
+directly as the `StatusCallback` URL passed on `Calls/connect` (set via
+`IVR_STATUS_CALLBACK_URL`, above), not through the App Bazaar flow. Nothing to
+configure in the Exotel dashboard for it beyond that env var.
+
 All four are **Gather** applets. The closing messages are Gather applets too,
 not Greeting applets — a Greeting applet's dynamic URL expects a different body
 (`{"greeting_url": "..."}` or `text/plain`) and would reject the Gather payload
@@ -179,6 +254,14 @@ supabase db push
 # Deploy the functions
 supabase functions deploy ivr-engine --use-api
 supabase functions deploy dynamic-greeting --use-api
+supabase functions deploy ivr-status-callback --use-api
+```
+
+After the first deploy of `ivr-status-callback`, set `IVR_STATUS_CALLBACK_URL`
+to its URL and re-set secrets so `ivr-engine` picks it up:
+
+```bash
+supabase secrets set IVR_STATUS_CALLBACK_URL="$FUNCTIONS_URL/ivr-status-callback"
 ```
 
 ## Integration notes

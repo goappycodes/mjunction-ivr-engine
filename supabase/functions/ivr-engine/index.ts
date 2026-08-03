@@ -82,11 +82,18 @@ export default {
         );
       }
 
+      // Falls back to the deployed ivr-status-callback URL so every call gets
+      // its telephony outcome (completed/failed/busy/no-answer) recorded
+      // without every caller of this API having to remember to pass one.
+      const statusCallbackUrl = body.statusCallbackUrl?.trim() ||
+        Deno.env.get("IVR_STATUS_CALLBACK_URL") ||
+        undefined;
+
       const callRequest: ExotelCallRequest = {
         phoneNumber,
         orderId,
         language: body.language,
-        statusCallbackUrl: body.statusCallbackUrl,
+        statusCallbackUrl,
         record: body.record,
       };
 
@@ -102,6 +109,7 @@ export default {
         orderId,
         step: "initiated",
         status: `CALL_${result.status.toUpperCase().replace(/-/g, "_")}`,
+        callStatus: result.status,
       });
 
       return json({

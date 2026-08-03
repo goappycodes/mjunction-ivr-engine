@@ -394,6 +394,10 @@ EXOTEL_ACCOUNT_SID = "env(EXOTEL_ACCOUNT_SID)"
 EXOTEL_SUBDOMAIN = "env(EXOTEL_SUBDOMAIN)"
 EXOTEL_CALLER_ID = "env(EXOTEL_CALLER_ID)"
 EXOTEL_APP_ID = "env(EXOTEL_APP_ID)"
+# Deployed URL of ivr-status-callback. Passed to Exotel as StatusCallback on
+# every call ivr-engine places, unless the caller of POST /ivr-engine supplies
+# its own statusCallbackUrl.
+IVR_STATUS_CALLBACK_URL = "env(IVR_STATUS_CALLBACK_URL)"
 
 [analytics]
 enabled = true
@@ -444,3 +448,9 @@ entrypoint = "./functions/dynamic-greeting/index.ts"
 # Specifies static files to be bundled with the function. Supports glob patterns.
 # For example, if you want to serve static HTML pages in your function:
 # static_files = [ "./functions/dynamic-greeting/*.html" ]
+
+[functions.ivr-status-callback]
+enabled = true
+verify_jwt = false
+import_map = "./functions/ivr-status-callback/deno.json"
+entrypoint = "./functions/ivr-status-callback/index.ts"

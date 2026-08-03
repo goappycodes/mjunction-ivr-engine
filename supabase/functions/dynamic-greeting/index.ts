@@ -7,6 +7,8 @@ import {
   type OrderRecord,
   withTimeout,
 } from "../_shared/orders.ts";
+import { firstOf, readDigits, readParams } from "../_shared/params.ts";
+import { IVR_STATES } from "../_shared/callState.ts";
 
 const JSON_HEADERS = {
   "Content-Type": "application/json",
@@ -84,58 +86,6 @@ function spellReference(ref: string): string {
     .replace(/(\d)/g, "$1 ")
     .replace(/\s+/g, " ")
     .trim();
-}
-
-// ---------------------------------------------------------------------------
-// Request parsing
-// ---------------------------------------------------------------------------
-
-/**
- * Exotel sends applet parameters as a query string on GET. POST bodies are also
- * accepted so the endpoint stays testable and tolerant of Passthru
- * configuration, but query params always win.
- */
-async function readParams(req: Request, url: URL): Promise<URLSearchParams> {
-  const params = new URLSearchParams(url.searchParams);
-
-  if (req.method === "POST" || req.method === "PUT") {
-    const raw = await req.text();
-    if (raw) {
-      const contentType = req.headers.get("content-type") ?? "";
-      try {
-        if (contentType.includes("application/json")) {
-          for (const [k, v] of Object.entries(JSON.parse(raw))) {
-            if (!params.has(k)) params.append(k, String(v));
-          }
-        } else {
-          for (const [k, v] of new URLSearchParams(raw)) {
-            if (!params.has(k)) params.append(k, v);
-          }
-        }
-      } catch (_e) {
-        console.warn("[readParams] unparseable body ignored");
-      }
-    }
-  }
-
-  return params;
-}
-
-function firstOf(params: URLSearchParams, ...keys: string[]): string {
-  for (const key of keys) {
-    const value = params.get(key);
-    if (value) return value.trim();
-  }
-  return "";
-}
-
-/**
- * Exotel documents that `digits` arrives wrapped in double quotes and must be
- * trimmed, e.g. `"1"`.
- */
-function readDigits(params: URLSearchParams): string {
-  return firstOf(params, "digits", "Digits", "dtmf", "DTMF")
-    .replace(/["\s]/g, "");
 }
 
 // ---------------------------------------------------------------------------
@@ -309,7 +259,7 @@ export default {
           callerNumber,
           orderId,
           step: "passthru",
-          status: "CALL_STARTED",
+          status: IVR_STATES.CALL_STARTED,
           appletHint: "passthru (explicit)",
         });
 
@@ -333,8 +283,10 @@ export default {
             // caller actually heard it depends on the applet type, which only
             // Exotel knows. Claiming PLAYED made silent calls look successful.
             status: stepParam
-              ? (order ? "WELCOME_SERVED" : "WELCOME_SERVED_NO_ORDER")
-              : "WELCOME_SERVED_NO_STEP",
+              ? (order
+                ? IVR_STATES.WELCOME_SERVED
+                : IVR_STATES.WELCOME_SERVED_NO_ORDER)
+              : IVR_STATES.WELCOME_SERVED_NO_STEP,
             appletHint,
           });
 
@@ -353,10 +305,10 @@ export default {
             step: "address",
             userInput: digits,
             status: digits === "2"
-              ? "ORDER_ISSUE_RAISED"
+              ? IVR_STATES.ORDER_ISSUE_RAISED
               : digits === "1"
-              ? "ORDER_CONFIRMED"
-              : "ADDRESS_PROMPT_SERVED",
+              ? IVR_STATES.ORDER_CONFIRMED
+              : IVR_STATES.ADDRESS_PROMPT_SERVED,
             appletHint,
           });
 
@@ -378,7 +330,9 @@ export default {
             orderId,
             step: "done",
             userInput: digits,
-            status: issue ? "ADDRESS_ISSUE_RAISED" : "ADDRESS_CONFIRMED",
+            status: issue
+              ? IVR_STATES.ADDRESS_ISSUE_RAISED
+              : IVR_STATES.ADDRESS_CONFIRMED,
             appletHint,
           });
 
@@ -395,7 +349,7 @@ export default {
             orderId,
             step,
             userInput: digits,
-            status: "UNKNOWN_STEP",
+            status: IVR_STATES.UNKNOWN_STEP,
             appletHint,
           });
 

@@ -6,6 +6,7 @@
  * client and queries live here rather than being duplicated.
  */
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { isTerminalCallStatus, normalizeCallStatus } from "./callState.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "http://127.0.0.1:54321";
 // Server-to-server: no end-user session exists, so use the service-role key.
@@ -157,6 +158,8 @@ export interface CallLogEntry {
   status: string;
   /** Which applet Exotel appears to have called from; recorded for diagnosis. */
   appletHint?: string;
+  /** Exotel's telephony-level Call.Status (`queued`, `in-progress`, ...), distinct from `status` above. */
+  callStatus?: string;
 }
 
 export async function upsertCallLog(entry: CallLogEntry): Promise<void> {
@@ -173,6 +176,7 @@ export async function upsertCallLog(entry: CallLogEntry): Promise<void> {
   // Never overwrite a known caller/order with undefined on a later step.
   if (entry.callerNumber) row.caller_number = entry.callerNumber;
   if (entry.orderId) row.order_id = entry.orderId;
+  if (entry.callStatus) row.call_status = entry.callStatus;
 
   const { error } = await client
     .from("ivr_logs")
@@ -216,4 +220,65 @@ export function logCallStep(entry: CallLogEntry): void {
   }).EdgeRuntime;
 
   if (runtime?.waitUntil) runtime.waitUntil(task);
+}
+
+export interface StatusCallbackEntry {
+  callSid: string;
+  /** Raw `Status`/`CallStatus` value as Exotel sent it. */
+  status: string;
+  eventType?: string;
+  /** Every param Exotel sent, verbatim, for the append-only audit trail. */
+  raw: Record<string, string>;
+}
+
+/**
+ * Records an Exotel StatusCallback: updates the call's telephony outcome on
+ * `ivr_logs` (leaving the conversational `status`/`step` columns untouched —
+ * those belong to `dynamic-greeting`) and appends the raw event to
+ * `ivr_status_events` unconditionally, so a status Exotel sends that we don't
+ * yet recognise is still captured rather than silently dropped.
+ */
+export async function recordStatusCallback(
+  entry: StatusCallbackEntry,
+): Promise<void> {
+  const client = db();
+  if (!client || !entry.callSid) return;
+
+  const normalized = normalizeCallStatus(entry.status);
+
+  const update: Record<string, unknown> = {
+    call_status: normalized ?? entry.status,
+    updated_at: new Date().toISOString(),
+  };
+  if (isTerminalCallStatus(entry.status)) {
+    update.ended_at = new Date().toISOString();
+  }
+
+  const { error } = await client
+    .from("ivr_logs")
+    .update(update)
+    .eq("call_sid", entry.callSid);
+
+  if (error) {
+    console.error(
+      "[recordStatusCallback] ivr_logs update failed:",
+      error.code,
+      error.message,
+    );
+  }
+
+  const { error: eventError } = await client.from("ivr_status_events").insert({
+    call_sid: entry.callSid,
+    status: entry.status,
+    event_type: entry.eventType ?? null,
+    raw: entry.raw,
+  });
+
+  if (eventError) {
+    console.error(
+      "[recordStatusCallback] event insert failed:",
+      eventError.code,
+      eventError.message,
+    );
+  }
 }
