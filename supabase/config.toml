@@ -444,3 +444,11 @@ entrypoint = "./functions/dynamic-greeting/index.ts"
 # Specifies static files to be bundled with the function. Supports glob patterns.
 # For example, if you want to serve static HTML pages in your function:
 # static_files = [ "./functions/dynamic-greeting/*.html" ]
+
+[functions.update-order-status]
+enabled = true
+# Called server-to-server by dynamic-greeting (fire-and-forget), same posture
+# as the other two IVR functions — Exotel/internal callers carry no JWT.
+verify_jwt = false
+import_map = "./functions/update-order-status/deno.json"
+entrypoint = "./functions/update-order-status/index.ts"

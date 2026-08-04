@@ -4,6 +4,7 @@ import {
   getOrderById,
   getOrderIdByCallSid,
   logCallStep,
+  notifyOrderStatusUpdate,
   type OrderRecord,
   withTimeout,
 } from "../_shared/orders.ts";
@@ -381,6 +382,14 @@ export default {
             status: issue ? "ADDRESS_ISSUE_RAISED" : "ADDRESS_CONFIRMED",
             appletHint,
           });
+
+          // Fire-and-forget: hand off to update-order-status so the DB write
+          // happens out of band. This must never delay or block the Exotel
+          // response below — notifyOrderStatusUpdate does not await the
+          // network call, it schedules it via EdgeRuntime.waitUntil.
+          if (orderId) {
+            notifyOrderStatusUpdate({ orderId, callSid, callerNumber, dtmf: digits });
+          }
 
           return speak(closingPrompt(order, issue));
         }

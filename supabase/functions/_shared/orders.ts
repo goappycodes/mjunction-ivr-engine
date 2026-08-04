@@ -217,3 +217,115 @@ export function logCallStep(entry: CallLogEntry): void {
 
   if (runtime?.waitUntil) runtime.waitUntil(task);
 }
+
+// ---------------------------------------------------------------------------
+// Order status updates — written by `update-order-status`, triggered by
+// `dynamic-greeting`.
+//
+// dynamic-greeting resolves the order and plays prompts but is not allowed to
+// write to `orders` itself; a separate function owns that write so the two
+// responsibilities (IVR flow vs. state mutation) stay independent and can be
+// redeployed/audited separately.
+// ---------------------------------------------------------------------------
+
+/** Only these two DTMF values represent a final decision worth persisting. */
+export const DTMF_STATUS_MAP: Record<string, string> = {
+  "1": "confirmed",
+  "2": "support_requested",
+};
+
+export interface OrderStatusUpdateResult {
+  success: boolean;
+  error?: string;
+}
+
+/**
+ * Direct DB write, used inside the `update-order-status` function itself.
+ * Distinguishes "no such order" from "the query failed" in the log, but both
+ * collapse to `success: false` for the caller — Exotel only needs to know
+ * whether to move on, not why.
+ */
+export async function updateOrderStatus(
+  orderId: string,
+  status: string,
+): Promise<OrderStatusUpdateResult> {
+  const client = db();
+  if (!client) {
+    return { success: false, error: "No Supabase key configured" };
+  }
+
+  const { data, error } = await client
+    .from("orders")
+    .update({ status, updated_at: new Date().toISOString() })
+    .eq("order_id", orderId)
+    .select("order_id")
+    .maybeSingle();
+
+  if (error) {
+    console.error("[updateOrderStatus] failed:", error.code, error.message);
+    return { success: false, error: `${error.code}: ${error.message}` };
+  }
+
+  if (!data) {
+    console.warn(`[updateOrderStatus] no order matched order_id="${orderId}"`);
+    return { success: false, error: `Order not found: ${orderId}` };
+  }
+
+  return { success: true };
+}
+
+export interface OrderStatusNotification {
+  orderId: string;
+  callSid: string;
+  callerNumber?: string;
+  dtmf: string;
+}
+
+/**
+ * Fire-and-forget call from `dynamic-greeting` to the `update-order-status`
+ * function. Uses the same `EdgeRuntime.waitUntil` pattern as `logCallStep`
+ * so the HTTP call can finish after the Exotel response has already gone
+ * out, without delaying it and without the isolate being torn down early.
+ *
+ * The target URL is derived from `SUPABASE_URL` (already required by this
+ * module) rather than a separate env var, so there is one less secret to
+ * keep in sync across environments. Both functions run with
+ * `verify_jwt = false`, so no Authorization header is strictly required;
+ * the service-role key is still attached as a bearer token as defense in
+ * depth in case JWT verification is ever turned back on.
+ */
+export function notifyOrderStatusUpdate(entry: OrderStatusNotification): void {
+  if (!DTMF_STATUS_MAP[entry.dtmf]) {
+    // Not "1" or "2" — nothing to persist. Don't fire a call the receiving
+    // function would just reject.
+    return;
+  }
+
+  const targetUrl = `${supabaseUrl.replace(/\/$/, "")}/functions/v1/update-order-status`;
+
+  const task = fetch(targetUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(supabaseKey ? { Authorization: `Bearer ${supabaseKey}` } : {}),
+    },
+    body: JSON.stringify(entry),
+  })
+    .then(async (res) => {
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        console.error(
+          `[notifyOrderStatusUpdate] update-order-status returned ${res.status}: ${text}`,
+        );
+      }
+    })
+    .catch((err) => {
+      console.error("[notifyOrderStatusUpdate] request failed:", err);
+    });
+
+  const runtime = (globalThis as {
+    EdgeRuntime?: { waitUntil?: (p: Promise<unknown>) => void };
+  }).EdgeRuntime;
+
+  if (runtime?.waitUntil) runtime.waitUntil(task);
+}
