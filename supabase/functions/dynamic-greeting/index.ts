@@ -40,11 +40,14 @@ function gather(text: string, repeatText?: string) {
     // valid and documented as "no finish key".
     max_input_digits: 1,
     finish_on_key: "",
-    input_timeout: 10,
+    // Known-good value. Exotel examples use <=6; a larger value (10) is outside
+    // the range Exotel reliably accepts and made it reject the Gather response,
+    // dropping the call. Keep this conservative.
+    input_timeout: 5,
   };
 
   if (repeatText) {
-    body.repeat_menu = 2;
+    body.repeat_menu = 1;
     body.repeat_gather_prompt = { text: clean(repeatText) };
   }
 
@@ -64,7 +67,7 @@ function speak(text: string) {
       gather_prompt: { text: clean(text) },
       max_input_digits: 1,
       finish_on_key: "",
-      input_timeout: 10,
+      input_timeout: 2,
     },
     { status: 200, headers: JSON_HEADERS },
   );

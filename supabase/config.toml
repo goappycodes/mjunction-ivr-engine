@@ -394,22 +394,14 @@ EXOTEL_ACCOUNT_SID = "env(EXOTEL_ACCOUNT_SID)"
 EXOTEL_SUBDOMAIN = "env(EXOTEL_SUBDOMAIN)"
 EXOTEL_CALLER_ID = "env(EXOTEL_CALLER_ID)"
 EXOTEL_APP_ID = "env(EXOTEL_APP_ID)"
-# Support-transfer (connect-support) settings. Only SUPPORT_NUMBER is required;
-# the rest are optional and fall back to sane defaults in config.ts. These are
-# read via the loosely-coupled resolver so they can move to the database later
-# without touching config.toml.
+# Support-transfer (connect-support) setting. Only SUPPORT_NUMBER is required;
+# every other SUPPORT_* option has a default in connect-support/config.ts, so it
+# does NOT need to be declared here. IMPORTANT: only list variables that are
+# actually set in supabase/.env.local — the CLI aborts `supabase start` with
+# "environment variable X is unset" for any env(X) it cannot resolve, which
+# takes down the whole local stack. To override an optional setting, add it to
+# .env.local AND add a matching `SUPPORT_FOO = "env(SUPPORT_FOO)"` line here.
 SUPPORT_NUMBER = "env(SUPPORT_NUMBER)"
-SUPPORT_NUMBERS = "env(SUPPORT_NUMBERS)"
-SUPPORT_COUNTRY_CODE = "env(SUPPORT_COUNTRY_CODE)"
-SUPPORT_OUTGOING_PHONE_NUMBER = "env(SUPPORT_OUTGOING_PHONE_NUMBER)"
-SUPPORT_RECORD = "env(SUPPORT_RECORD)"
-SUPPORT_RECORDING_CHANNELS = "env(SUPPORT_RECORDING_CHANNELS)"
-SUPPORT_MAX_RINGING_DURATION = "env(SUPPORT_MAX_RINGING_DURATION)"
-SUPPORT_MAX_CONVERSATION_DURATION = "env(SUPPORT_MAX_CONVERSATION_DURATION)"
-SUPPORT_MUSIC_ON_HOLD_TYPE = "env(SUPPORT_MUSIC_ON_HOLD_TYPE)"
-SUPPORT_WAIT_MESSAGE = "env(SUPPORT_WAIT_MESSAGE)"
-SUPPORT_FETCH_AFTER_ATTEMPT = "env(SUPPORT_FETCH_AFTER_ATTEMPT)"
-SUPPORT_CONNECT_STATUS = "env(SUPPORT_CONNECT_STATUS)"
 
 [analytics]
 enabled = true

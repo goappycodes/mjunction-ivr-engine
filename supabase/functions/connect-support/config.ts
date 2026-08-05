@@ -67,7 +67,11 @@ const DEFAULTS = {
   maxRingingDuration: 30,
   maxConversationDuration: 900,
   musicOnHoldType: "default_tone" as const,
-  waitMessage: "Please wait while we connect you to our support team.",
+  // Off by default. start_call_playback is an easy way to make Exotel reject the
+  // whole Connect response (its playback_to enum is narrow — the docs only show
+  // "both"/"callee"), which drops the call. Opt in via SUPPORT_WAIT_MESSAGE once
+  // the basic transfer is confirmed working.
+  waitMessage: "",
   orderStatus: "issue_raised",
 };
 
@@ -144,10 +148,19 @@ export async function resolveConnectConfig(
     ? moh
     : DEFAULTS.musicOnHoldType;
 
+  // Only set outgoing_phone_number when it is explicitly configured AND a valid
+  // E.164 ExoPhone. Exotel requires E.164 here; the old default of EXOTEL_CALLER_ID
+  // ("02249360074", not E.164) made Exotel reject the Connect response and drop
+  // the call. Omitting it makes Exotel dial the agent from the same ExoPhone as
+  // the first leg, which is exactly what we want.
+  const outgoingRaw = env("SUPPORT_OUTGOING_PHONE_NUMBER");
+  const outgoingPhoneNumber = outgoingRaw
+    ? toE164(outgoingRaw, countryCode)
+    : undefined;
+
   return {
     numbers,
-    outgoingPhoneNumber: env("SUPPORT_OUTGOING_PHONE_NUMBER") ??
-      env("EXOTEL_CALLER_ID"),
+    outgoingPhoneNumber,
     record: parseBool(env("SUPPORT_RECORD"), DEFAULTS.record),
     recordingChannels: channels,
     maxRingingDuration: parseIntClamped(

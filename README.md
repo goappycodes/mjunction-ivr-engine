@@ -115,7 +115,8 @@ rest are optional and fall back to the defaults in `connect-support/config.ts`:
   `+91...`; normalised to E.164). `SUPPORT_NUMBERS` (comma-separated) overrides
   it for a hunt group.
 - `SUPPORT_COUNTRY_CODE` (default `91`), `SUPPORT_OUTGOING_PHONE_NUMBER`
-  (defaults to `EXOTEL_CALLER_ID`), `SUPPORT_RECORD` (default `true`),
+  (optional, **must be E.164**; omitted by default so Exotel uses the first-leg
+  ExoPhone), `SUPPORT_RECORD` (default `true`),
   `SUPPORT_RECORDING_CHANNELS` (`single`|`dual`, default `dual`),
   `SUPPORT_MAX_RINGING_DURATION` (default `30`, max `60`),
   `SUPPORT_MAX_CONVERSATION_DURATION` (default `900`, max `4500`),
@@ -180,19 +181,25 @@ resolved config:
 {
   "destination": { "numbers": ["+917872944208"] },
   "fetch_after_attempt": false,
-  "outgoing_phone_number": "02249360074",
   "record": true,
   "recording_channels": "dual",
   "max_ringing_duration": 30,
   "max_conversation_duration": 900,
-  "music_on_hold": { "type": "default_tone" },
-  "start_call_playback": {
-    "playback_to": "caller",
-    "type": "text",
-    "value": "Please wait while we connect you to our support team."
-  }
+  "music_on_hold": { "type": "default_tone" }
 }
 ```
+
+Every value here must match Exotel's documented Connect contract exactly, or
+Exotel rejects the response and **drops the call** (it does not gracefully ignore
+a bad field). Two fields are therefore off by default:
+
+- `outgoing_phone_number` is **omitted** unless `SUPPORT_OUTGOING_PHONE_NUMBER`
+  is set. Exotel requires it to be a valid **E.164 ExoPhone**; when omitted it
+  dials the agent from the same ExoPhone as the first leg (the desired
+  behaviour). Do **not** point it at a non-E.164 number like `02249360074`.
+- `start_call_playback` is **omitted** unless `SUPPORT_WAIT_MESSAGE` is set. Its
+  `playback_to` only accepts documented values (`both` / `callee`), so it is a
+  common way to get the whole response rejected.
 
 The support number is read from `SUPPORT_NUMBER` today. Routing is deliberately
 loosely coupled: `config.ts` resolves the whole config behind a stable

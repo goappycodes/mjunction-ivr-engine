@@ -34,7 +34,9 @@ export interface ExotelConnectResponse {
   music_on_hold: { type: string };
   outgoing_phone_number?: string;
   start_call_playback?: {
-    playback_to: "caller" | "callee" | "both";
+    // Exotel's documented values are "both" and "callee". "caller" is NOT
+    // documented and made Exotel reject the whole Connect response.
+    playback_to: "callee" | "both";
     type: "text" | "audio_url";
     value: string;
   };
@@ -58,11 +60,11 @@ export function buildConnectResponse(
     response.outgoing_phone_number = config.outgoingPhoneNumber;
   }
 
-  // Reassure the caller while the agent's phone rings. Played to the caller
-  // only — the agent hears the caller once bridged, not this prompt.
+  // Optional greeting played when the bridge starts. "both" is a documented,
+  // safe playback_to value. Off unless SUPPORT_WAIT_MESSAGE is set.
   if (config.waitMessage.trim()) {
     response.start_call_playback = {
-      playback_to: "caller",
+      playback_to: "both",
       type: "text",
       value: config.waitMessage.trim(),
     };
