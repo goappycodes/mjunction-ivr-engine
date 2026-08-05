@@ -278,7 +278,14 @@ export interface OrderStatusNotification {
   orderId: string;
   callSid: string;
   callerNumber?: string;
-  dtmf: string;
+  /** DTMF path: a keypress mapped to a status via `DTMF_STATUS_MAP`. */
+  dtmf?: string;
+  /**
+   * Explicit status, for triggers that are not a keypress — e.g. a support
+   * transfer marking the order `issue_raised`. Wins over `dtmf` when both are
+   * present.
+   */
+  status?: string;
 }
 
 /**
@@ -295,9 +302,11 @@ export interface OrderStatusNotification {
  * depth in case JWT verification is ever turned back on.
  */
 export function notifyOrderStatusUpdate(entry: OrderStatusNotification): void {
-  if (!DTMF_STATUS_MAP[entry.dtmf]) {
-    // Not "1" or "2" — nothing to persist. Don't fire a call the receiving
-    // function would just reject.
+  // Resolve the target status here so a call that has nothing to persist is
+  // never fired. An explicit status wins; otherwise the DTMF digit must map to
+  // one ("1"/"2"). Anything else is a no-op.
+  const status = entry.status?.trim() || DTMF_STATUS_MAP[entry.dtmf ?? ""];
+  if (!status) {
     return;
   }
 
@@ -309,7 +318,9 @@ export function notifyOrderStatusUpdate(entry: OrderStatusNotification): void {
       "Content-Type": "application/json",
       ...(supabaseKey ? { Authorization: `Bearer ${supabaseKey}` } : {}),
     },
-    body: JSON.stringify(entry),
+    // Send the resolved status explicitly so the receiver does not have to
+    // re-derive it from the digit.
+    body: JSON.stringify({ ...entry, status }),
   })
     .then(async (res) => {
       if (!res.ok) {

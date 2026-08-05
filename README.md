@@ -12,8 +12,13 @@ Exotel Voice v1 API and for serving the dynamic call flow.
 `supabase/functions/dynamic-greeting/` — serves the live call flow to Exotel
 - `index.ts` - Passthru (call-start) + dynamic Gather endpoints
 
+`supabase/functions/connect-support/` — transfers the caller to a live agent
+- `index.ts` - Exotel Connect applet (Dynamic URL) endpoint
+- `config.ts` - resolves the support number + connect settings (env now, DB later)
+- `exotel.ts` - maps that config onto Exotel's Connect response schema
+
 `supabase/functions/_shared/`
-- `orders.ts` - order lookups, call logging, timeout guard (used by both)
+- `orders.ts` - order lookups, call logging, timeout guard (used by all)
 
 ## How the order id flows through the call
 
@@ -104,6 +109,21 @@ and surfaced to the local edge runtime by the `[edge_runtime.secrets]` block in
 - `EXOTEL_CALLER_ID`
 - `EXOTEL_APP_ID`
 
+`connect-support` needs a support number. Only `SUPPORT_NUMBER` is required; the
+rest are optional and fall back to the defaults in `connect-support/config.ts`:
+- `SUPPORT_NUMBER` — the agent number (bare `7872944208`, country-coded, or
+  `+91...`; normalised to E.164). `SUPPORT_NUMBERS` (comma-separated) overrides
+  it for a hunt group.
+- `SUPPORT_COUNTRY_CODE` (default `91`), `SUPPORT_OUTGOING_PHONE_NUMBER`
+  (defaults to `EXOTEL_CALLER_ID`), `SUPPORT_RECORD` (default `true`),
+  `SUPPORT_RECORDING_CHANNELS` (`single`|`dual`, default `dual`),
+  `SUPPORT_MAX_RINGING_DURATION` (default `30`, max `60`),
+  `SUPPORT_MAX_CONVERSATION_DURATION` (default `900`, max `4500`),
+  `SUPPORT_MUSIC_ON_HOLD_TYPE` (default `default_tone`), `SUPPORT_WAIT_MESSAGE`,
+  `SUPPORT_FETCH_AFTER_ATTEMPT` (default `false`),
+  `SUPPORT_CONNECT_STATUS` (order status written on transfer, default
+  `issue_raised`; set empty to disable the status update).
+
 `supabase start` has no `--env-file` flag — `env(...)` in `config.toml` is
 resolved from the **process environment**, so the file must be exported into the
 shell first. Verified procedure:
@@ -143,6 +163,53 @@ which is why `step=address` records the answer to the order question, and
 
 Any unrecognised `step` now returns a valid closing message rather than a 404.
 
+### Transferring to a live agent (Connect applet)
+
+To let a caller reach the support team, add a **Connect** applet to the Exotel
+flow and point its **Dynamic URL** at `connect-support`:
+
+| Applet | URL | Purpose |
+| --- | --- | --- |
+| Connect (Dynamic URL) | `<FUNCTIONS_URL>/connect-support` | Dials the support number and bridges the caller |
+
+Exotel GETs this URL mid-call and expects an `application/json` body describing
+the destination and call settings. `connect-support` builds that body from the
+resolved config:
+
+```json
+{
+  "destination": { "numbers": ["+917872944208"] },
+  "fetch_after_attempt": false,
+  "outgoing_phone_number": "02249360074",
+  "record": true,
+  "recording_channels": "dual",
+  "max_ringing_duration": 30,
+  "max_conversation_duration": 900,
+  "music_on_hold": { "type": "default_tone" },
+  "start_call_playback": {
+    "playback_to": "caller",
+    "type": "text",
+    "value": "Please wait while we connect you to our support team."
+  }
+}
+```
+
+The support number is read from `SUPPORT_NUMBER` today. Routing is deliberately
+loosely coupled: `config.ts` resolves the whole config behind a stable
+`ConnectConfig` type, so it can later be fetched per-order from the database
+without touching the Exotel mapping in `exotel.ts`. Exotel echoes `CustomField`
+(the order id) and `CallSid` to this URL, so a future DB resolver already has the
+context it needs to route.
+
+If no number is configured the endpoint returns HTTP 500 (not a broken 200), so
+Exotel runs its configured fallback instead of bridging the caller to dead air.
+
+When it serves a number, `connect-support` also marks the order — status
+`issue_raised` by default (`SUPPORT_CONNECT_STATUS`) — by calling
+`update-order-status` fire-and-forget, the same way `dynamic-greeting` does. It
+never writes to `orders` directly; that write stays owned by one function. The
+update is skipped for inbound calls that carry no order id.
+
 All four are **Gather** applets. The closing messages are Gather applets too,
 not Greeting applets — a Greeting applet's dynamic URL expects a different body
 (`{"greeting_url": "..."}` or `text/plain`) and would reject the Gather payload
@@ -179,6 +246,7 @@ supabase db push
 # Deploy the functions
 supabase functions deploy ivr-engine --use-api
 supabase functions deploy dynamic-greeting --use-api
+supabase functions deploy connect-support --use-api
 ```
 
 ## Integration notes

@@ -394,6 +394,22 @@ EXOTEL_ACCOUNT_SID = "env(EXOTEL_ACCOUNT_SID)"
 EXOTEL_SUBDOMAIN = "env(EXOTEL_SUBDOMAIN)"
 EXOTEL_CALLER_ID = "env(EXOTEL_CALLER_ID)"
 EXOTEL_APP_ID = "env(EXOTEL_APP_ID)"
+# Support-transfer (connect-support) settings. Only SUPPORT_NUMBER is required;
+# the rest are optional and fall back to sane defaults in config.ts. These are
+# read via the loosely-coupled resolver so they can move to the database later
+# without touching config.toml.
+SUPPORT_NUMBER = "env(SUPPORT_NUMBER)"
+SUPPORT_NUMBERS = "env(SUPPORT_NUMBERS)"
+SUPPORT_COUNTRY_CODE = "env(SUPPORT_COUNTRY_CODE)"
+SUPPORT_OUTGOING_PHONE_NUMBER = "env(SUPPORT_OUTGOING_PHONE_NUMBER)"
+SUPPORT_RECORD = "env(SUPPORT_RECORD)"
+SUPPORT_RECORDING_CHANNELS = "env(SUPPORT_RECORDING_CHANNELS)"
+SUPPORT_MAX_RINGING_DURATION = "env(SUPPORT_MAX_RINGING_DURATION)"
+SUPPORT_MAX_CONVERSATION_DURATION = "env(SUPPORT_MAX_CONVERSATION_DURATION)"
+SUPPORT_MUSIC_ON_HOLD_TYPE = "env(SUPPORT_MUSIC_ON_HOLD_TYPE)"
+SUPPORT_WAIT_MESSAGE = "env(SUPPORT_WAIT_MESSAGE)"
+SUPPORT_FETCH_AFTER_ATTEMPT = "env(SUPPORT_FETCH_AFTER_ATTEMPT)"
+SUPPORT_CONNECT_STATUS = "env(SUPPORT_CONNECT_STATUS)"
 
 [analytics]
 enabled = true
@@ -452,3 +468,12 @@ enabled = true
 verify_jwt = false
 import_map = "./functions/update-order-status/deno.json"
 entrypoint = "./functions/update-order-status/index.ts"
+
+[functions.connect-support]
+enabled = true
+# Fetched by Exotel's Connect applet (Dynamic URL) mid-call to obtain the
+# support number and connect settings. Exotel carries no JWT, same as the
+# other applet endpoints.
+verify_jwt = false
+import_map = "./functions/connect-support/deno.json"
+entrypoint = "./functions/connect-support/index.ts"

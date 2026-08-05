@@ -40,11 +40,11 @@ function gather(text: string, repeatText?: string) {
     // valid and documented as "no finish key".
     max_input_digits: 1,
     finish_on_key: "",
-    input_timeout: 5,
+    input_timeout: 10,
   };
 
   if (repeatText) {
-    body.repeat_menu = 1;
+    body.repeat_menu = 2;
     body.repeat_gather_prompt = { text: clean(repeatText) };
   }
 
@@ -59,12 +59,15 @@ function gather(text: string, repeatText?: string) {
  * the trailing dead air down.
  */
 function speak(text: string) {
-  return Response.json({
-    gather_prompt: { text: clean(text) },
-    max_input_digits: 1,
-    finish_on_key: "",
-    input_timeout: 2,
-  }, { status: 200, headers: JSON_HEADERS });
+  return Response.json(
+    {
+      gather_prompt: { text: clean(text) },
+      max_input_digits: 1,
+      finish_on_key: "",
+      input_timeout: 10,
+    },
+    { status: 200, headers: JSON_HEADERS },
+  );
 }
 
 /** Collapse whitespace so the TTS engine gets a clean single-line prompt. */
@@ -135,8 +138,10 @@ function firstOf(params: URLSearchParams, ...keys: string[]): string {
  * trimmed, e.g. `"1"`.
  */
 function readDigits(params: URLSearchParams): string {
-  return firstOf(params, "digits", "Digits", "dtmf", "DTMF")
-    .replace(/["\s]/g, "");
+  return firstOf(params, "digits", "Digits", "dtmf", "DTMF").replace(
+    /["\s]/g,
+    "",
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -167,21 +172,26 @@ async function resolveOrder(
     (async () => {
       if (customField) {
         const order = await getOrderById(customField);
-        if (order) return { order, orderId: order.order_id, source: "CustomField" };
-        console.warn(`[resolveOrder] CustomField "${customField}" matched no order`);
+        if (order)
+          return { order, orderId: order.order_id, source: "CustomField" };
+        console.warn(
+          `[resolveOrder] CustomField "${customField}" matched no order`,
+        );
       }
 
       if (callSid) {
         const mapped = await getOrderIdByCallSid(callSid);
         if (mapped) {
           const order = await getOrderById(mapped);
-          if (order) return { order, orderId: order.order_id, source: "CallSid" };
+          if (order)
+            return { order, orderId: order.order_id, source: "CallSid" };
         }
       }
 
       if (from) {
         const order = await getOrderByPhone(from);
-        if (order) return { order, orderId: order.order_id, source: "CallFrom" };
+        if (order)
+          return { order, orderId: order.order_id, source: "CallFrom" };
       }
 
       return { order: null, orderId: customField, source: "unresolved" };
@@ -203,7 +213,9 @@ function welcomePrompt(order: OrderRecord | null): string {
       Press 1 to confirm your order. Press 2 if you have any issues.`;
   }
 
-  const greeting = order.customer_name ? `Hello ${order.customer_name}.` : "Hello.";
+  const greeting = order.customer_name
+    ? `Hello ${order.customer_name}.`
+    : "Hello.";
   const item = order.product_name ? ` for ${order.product_name}` : "";
 
   return `${greeting} This is a call from mjunction regarding your order
@@ -281,8 +293,8 @@ export default {
       const appletHint = stepParam
         ? "gather"
         : `no-step (likely passthru; CallType=${
-          firstOf(params, "CallType") || "?"
-        })`;
+            firstOf(params, "CallType") || "?"
+          })`;
 
       const { order, orderId, source } = await resolveOrder(params);
 
@@ -334,7 +346,9 @@ export default {
             // caller actually heard it depends on the applet type, which only
             // Exotel knows. Claiming PLAYED made silent calls look successful.
             status: stepParam
-              ? (order ? "WELCOME_SERVED" : "WELCOME_SERVED_NO_ORDER")
+              ? order
+                ? "WELCOME_SERVED"
+                : "WELCOME_SERVED_NO_ORDER"
               : "WELCOME_SERVED_NO_STEP",
             appletHint,
           });
@@ -353,11 +367,12 @@ export default {
             orderId,
             step: "address",
             userInput: digits,
-            status: digits === "2"
-              ? "ORDER_ISSUE_RAISED"
-              : digits === "1"
-              ? "ORDER_CONFIRMED"
-              : "ADDRESS_PROMPT_SERVED",
+            status:
+              digits === "2"
+                ? "ORDER_ISSUE_RAISED"
+                : digits === "1"
+                  ? "ORDER_CONFIRMED"
+                  : "ADDRESS_PROMPT_SERVED",
             appletHint,
           });
 
@@ -388,7 +403,12 @@ export default {
           // response below — notifyOrderStatusUpdate does not await the
           // network call, it schedules it via EdgeRuntime.waitUntil.
           if (orderId) {
-            notifyOrderStatusUpdate({ orderId, callSid, callerNumber, dtmf: digits });
+            notifyOrderStatusUpdate({
+              orderId,
+              callSid,
+              callerNumber,
+              dtmf: digits,
+            });
           }
 
           return speak(closingPrompt(order, issue));

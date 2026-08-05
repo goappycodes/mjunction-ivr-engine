@@ -16,6 +16,11 @@ interface UpdateOrderStatusBody {
   callSid?: string;
   callerNumber?: string;
   dtmf?: string;
+  /**
+   * Explicit status set by non-keypress triggers (e.g. connect-support marking
+   * the order `issue_raised`). Takes precedence over `dtmf` when both are sent.
+   */
+  status?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -59,15 +64,22 @@ export default {
     const callSid = body.callSid?.trim() ?? "";
     const callerNumber = body.callerNumber?.trim() ?? "";
     const dtmf = body.dtmf?.trim() ?? "";
+    const explicitStatus = body.status?.trim() ?? "";
 
     if (!orderId) {
       return json({ success: false, error: "orderId is required" }, 400);
     }
-    if (!dtmf) {
-      return json({ success: false, error: "dtmf is required" }, 400);
+    if (!dtmf && !explicitStatus) {
+      return json(
+        { success: false, error: "dtmf or status is required" },
+        400,
+      );
     }
 
-    const status = DTMF_STATUS_MAP[dtmf];
+    // An explicit status wins; otherwise map the keypress. This is what lets
+    // connect-support set `issue_raised` on transfer while the greeting flow
+    // keeps mapping 1/2 to confirmed/support_requested.
+    const status = explicitStatus || DTMF_STATUS_MAP[dtmf];
     if (!status) {
       // Not a hard failure — just nothing for this endpoint to do with a
       // digit outside 1/2. Logged so an unexpected digit shape is visible
@@ -91,7 +103,7 @@ export default {
 
       console.log(
         `[update-order-status] order=${orderId} callSid=${callSid || "-"} ` +
-          `caller=${callerNumber || "-"} dtmf=${dtmf} -> status=${status}`,
+          `caller=${callerNumber || "-"} dtmf=${dtmf || "-"} -> status=${status}`,
       );
 
       return json({ success: true }, 200);
