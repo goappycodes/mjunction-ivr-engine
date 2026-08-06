@@ -62,8 +62,16 @@ const MAX_CONVERSATION_CAP = 4500;
 
 const DEFAULTS = {
   countryCode: "91",
-  record: true,
-  recordingChannels: "dual" as const,
+  // Off by default. Sending "record": true to an Exotel account that doesn't
+  // have call recording enabled can make Exotel reject the whole Connect
+  // response, dropping the call. Opt in via SUPPORT_RECORD=true only once call
+  // recording is confirmed enabled on the account.
+  record: false,
+  // Exotel's own documented default is "single" — not every account/plan is
+  // guaranteed to support dual-channel recording. Only relevant once
+  // SUPPORT_RECORD is enabled; kept at Exotel's default so turning recording on
+  // later doesn't also require remembering to set this.
+  recordingChannels: "single" as const,
   maxRingingDuration: 30,
   maxConversationDuration: 900,
   musicOnHoldType: "default_tone" as const,

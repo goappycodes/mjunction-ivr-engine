@@ -1,5 +1,6 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { DTMF_STATUS_MAP, updateOrderStatus } from "../_shared/orders.ts";
+import { type LogLevel, logEvent } from "../_shared/logging.ts";
 
 const JSON_HEADERS = {
   "Content-Type": "application/json",
@@ -39,7 +40,31 @@ interface UpdateOrderStatusBody {
 
 export default {
   fetch: async (req: Request) => {
+    const startedAt = Date.now();
+    let bodyForLog: unknown = undefined;
+
+    const log = (
+      level: LogLevel,
+      event: string,
+      message: string,
+      status: number,
+      extra: Partial<Parameters<typeof logEvent>[0]> = {},
+    ) =>
+      logEvent({
+        fn: "update-order-status",
+        level,
+        event,
+        message,
+        method: req.method,
+        url: req.url,
+        params: bodyForLog as Record<string, unknown> | undefined,
+        status,
+        durationMs: Date.now() - startedAt,
+        ...extra,
+      });
+
     if (req.method === "OPTIONS") {
+      log("success", "options_preflight", "CORS preflight", 200);
       return new Response(null, {
         headers: {
           "Access-Control-Allow-Origin": "*",
@@ -50,13 +75,16 @@ export default {
     }
 
     if (req.method !== "POST") {
+      log("warning", "method_not_allowed", `${req.method} not allowed`, 405);
       return json({ success: false, error: "Method not allowed" }, 405);
     }
 
     let body: UpdateOrderStatusBody;
     try {
       body = await req.json();
+      bodyForLog = body;
     } catch (_e) {
+      log("warning", "invalid_json_body", "Request body is not valid JSON", 400);
       return json({ success: false, error: "Invalid JSON body" }, 400);
     }
 
@@ -67,9 +95,17 @@ export default {
     const explicitStatus = body.status?.trim() ?? "";
 
     if (!orderId) {
+      log("warning", "order_id_missing", "orderId is required", 400);
       return json({ success: false, error: "orderId is required" }, 400);
     }
     if (!dtmf && !explicitStatus) {
+      log(
+        "warning",
+        "dtmf_or_status_missing",
+        "dtmf or status is required",
+        400,
+        { orderId, callSid, callerNumber },
+      );
       return json(
         { success: false, error: "dtmf or status is required" },
         400,
@@ -84,8 +120,12 @@ export default {
       // Not a hard failure — just nothing for this endpoint to do with a
       // digit outside 1/2. Logged so an unexpected digit shape is visible
       // without failing the caller.
-      console.warn(
-        `[update-order-status] unhandled dtmf="${dtmf}" order=${orderId} callSid=${callSid || "-"}`,
+      log(
+        "warning",
+        "unhandled_dtmf",
+        `Unhandled dtmf value: ${dtmf}`,
+        200,
+        { orderId, callSid, callerNumber },
       );
       return json({ success: false, error: `Unhandled dtmf value: ${dtmf}` }, 200);
     }
@@ -94,21 +134,34 @@ export default {
       const result = await updateOrderStatus(orderId, status);
 
       if (!result.success) {
-        console.error(
-          `[update-order-status] update failed order=${orderId} callSid=${callSid || "-"} error=${result.error}`,
-        );
         const notFound = result.error?.startsWith("Order not found");
+        log(
+          "error",
+          "update_failed",
+          `Update failed: ${result.error}`,
+          notFound ? 404 : 500,
+          { orderId, callSid, callerNumber },
+        );
         return json({ success: false, error: result.error }, notFound ? 404 : 500);
       }
 
-      console.log(
-        `[update-order-status] order=${orderId} callSid=${callSid || "-"} ` +
-          `caller=${callerNumber || "-"} dtmf=${dtmf || "-"} -> status=${status}`,
+      log(
+        "success",
+        "status_updated",
+        `order=${orderId} -> status=${status}`,
+        200,
+        { orderId, callSid, callerNumber },
       );
 
       return json({ success: true }, 200);
     } catch (err) {
-      console.error("[update-order-status] unexpected error:", err);
+      const message = err instanceof Error ? err.message : String(err);
+      log("error", "unhandled_exception", message, 500, {
+        orderId,
+        callSid,
+        callerNumber,
+        error: err instanceof Error ? (err.stack ?? err.message) : String(err),
+      });
       return json({ success: false, error: "Internal server error" }, 500);
     }
   },

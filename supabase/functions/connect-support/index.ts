@@ -1,5 +1,6 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { logCallStep, notifyOrderStatusUpdate } from "../_shared/orders.ts";
+import { logEvent } from "../_shared/logging.ts";
 import { type ConnectContext, resolveConnectConfig } from "./config.ts";
 import { buildConnectResponse } from "./exotel.ts";
 
@@ -61,10 +62,21 @@ function firstOf(params: URLSearchParams, ...keys: string[]): string {
 
 export default {
   fetch: async (req: Request) => {
+    const startedAt = Date.now();
     const url = new URL(req.url);
 
     try {
       if (req.method === "OPTIONS") {
+        logEvent({
+          fn: "connect-support",
+          level: "success",
+          event: "options_preflight",
+          message: "CORS preflight",
+          method: req.method,
+          url: req.url,
+          status: 200,
+          durationMs: Date.now() - startedAt,
+        });
         return new Response(null, {
           headers: {
             "Access-Control-Allow-Origin": "*",
@@ -75,6 +87,7 @@ export default {
       }
 
       const params = await readParams(req, url);
+      const allParams = Object.fromEntries(params.entries());
       const callSid = firstOf(params, "CallSid", "call_sid");
       const callerNumber = firstOf(params, "CallFrom", "From", "caller_number");
       const orderId = firstOf(params, "CustomField", "custom_field");
@@ -87,10 +100,20 @@ export default {
       // visible in Exotel (which can then run its configured fallback URL)
       // rather than silently bridging the caller to dead air.
       if (config.numbers.length === 0) {
-        console.error(
-          "[connect-support] no support number configured — set SUPPORT_NUMBER " +
-            `(callSid=${callSid || "-"} order=${orderId || "-"})`,
-        );
+        logEvent({
+          fn: "connect-support",
+          level: "error",
+          event: "no_support_number",
+          message: "No support number configured — set SUPPORT_NUMBER",
+          method: req.method,
+          url: req.url,
+          params: allParams,
+          status: 500,
+          callSid,
+          callerNumber,
+          orderId,
+          durationMs: Date.now() - startedAt,
+        });
         logCallStep({
           callSid,
           callerNumber,
@@ -106,13 +129,6 @@ export default {
       }
 
       const responseBody = buildConnectResponse(config);
-
-      console.log(
-        `[connect-support] callSid=${callSid || "-"} from=${callerNumber || "-"} ` +
-          `order=${orderId || "-"} -> dialing ${config.numbers.join(",")} ` +
-          `(ring=${config.maxRingingDuration}s max=${config.maxConversationDuration}s ` +
-          `record=${config.record})`,
-      );
 
       logCallStep({
         callSid,
@@ -136,12 +152,41 @@ export default {
         });
       }
 
+      logEvent({
+        fn: "connect-support",
+        level: "success",
+        event: "connect_served",
+        message: `Dialing ${config.numbers.join(",")} ` +
+          `(ring=${config.maxRingingDuration}s max=${config.maxConversationDuration}s ` +
+          `record=${config.record})`,
+        method: req.method,
+        url: req.url,
+        params: allParams,
+        status: 200,
+        body: responseBody,
+        callSid,
+        callerNumber,
+        orderId,
+        durationMs: Date.now() - startedAt,
+      });
+
       return Response.json(responseBody, {
         status: 200,
         headers: JSON_HEADERS,
       });
     } catch (err) {
-      console.error("[connect-support] unexpected error:", err);
+      const message = err instanceof Error ? err.message : String(err);
+      logEvent({
+        fn: "connect-support",
+        level: "error",
+        event: "unhandled_exception",
+        message,
+        method: req.method,
+        url: req.url,
+        status: 500,
+        error: err instanceof Error ? (err.stack ?? err.message) : String(err),
+        durationMs: Date.now() - startedAt,
+      });
       // Non-200 so Exotel does not try to bridge on a broken body.
       return Response.json(
         { error: "Internal Server Error" },
