@@ -1,6 +1,12 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { startExotelCall, type ExotelCallRequest } from "./exotel.ts";
-import { lookupOrderById, upsertCallLog } from "../_shared/orders.ts";
+import {
+  functionsUrl,
+  lookupOrderById,
+  startCallAttempt,
+  transitionRecipientStatus,
+  upsertCallLog,
+} from "../_shared/orders.ts";
 import { type LogLevel, logEvent } from "../_shared/logging.ts";
 
 const JSON_HEADERS = {
@@ -107,7 +113,7 @@ export default {
         return json({
           success: false,
           error: `Unknown orderId: ${orderId}`,
-          hint: "No row in public.orders with this order_id",
+          hint: "No row in public.recipients with this unique_id",
         }, 404);
       }
 
@@ -130,26 +136,56 @@ export default {
         );
       }
 
+      // The recipient is now "in a call" for order confirmation — bootstrap
+      // it out of `imported` before the outcome is known, mirroring
+      // recordOrderConfirmationCall's "ensure enqueued" step in mjunction.
+      // Already-in-flight/retry recipients (order_confirm_pending,
+      // order_unreachable) are left as-is; canTransition would reject moving
+      // sideways into the same or a non-adjacent status anyway.
+      if (order.status === "imported") {
+        await transitionRecipientStatus({
+          recipientId: order.recipient_id,
+          from: order.status,
+          to: "order_confirm_pending",
+          payload: { via: "order_confirmation", reason: "call_initiated" },
+        });
+      }
+
+      // Open the call_attempts row now, at dial time, rather than waiting for
+      // the outcome — this is the row dynamic-greeting/update-order-status
+      // finalize later, and it's what makes the recipient's status move
+      // *during* the call instead of only once at the very end.
+      const attempt = await startCallAttempt({
+        recipientId: order.recipient_id,
+        campaignId: order.campaign_id,
+        callType: "order_confirmation",
+      });
+
       const callRequest: ExotelCallRequest = {
         phoneNumber,
         orderId,
         language: body.language,
-        statusCallbackUrl: body.statusCallbackUrl,
+        // Default to this project's own status-callback function so a
+        // recording URL / no-answer outcome is captured even when the caller
+        // doesn't pass one explicitly.
+        statusCallbackUrl: body.statusCallbackUrl ??
+          functionsUrl("status-callback"),
         record: body.record,
       };
 
       const result = await startExotelCall(callRequest);
 
-      // Record the CallSid to order mapping now, so dynamic-greeting can recover
-      // the order id from the CallSid alone if a given applet request arrives
-      // without CustomField. Awaited: the reply is not latency-critical here and
-      // the mapping should exist before Exotel starts hitting the applets.
+      // Record the CallSid to order + call_attempt mapping now, so later
+      // steps can recover both from the CallSid alone. Awaited: the reply is
+      // not latency-critical here and the mapping should exist before Exotel
+      // starts hitting the applets.
       await upsertCallLog({
         callSid: result.providerCallRef,
         callerNumber: phoneNumber,
         orderId,
         step: "initiated",
         status: `CALL_${result.status.toUpperCase().replace(/-/g, "_")}`,
+        callAttemptId: attempt?.id,
       });
 
       log(
@@ -161,7 +197,7 @@ export default {
           orderId,
           callSid: result.providerCallRef,
           callerNumber: phoneNumber,
-          body: result,
+          body: { ...result, callAttemptId: attempt?.id, attemptNumber: attempt?.attemptNumber },
         },
       );
 

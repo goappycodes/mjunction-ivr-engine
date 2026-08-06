@@ -1,12 +1,22 @@
 # Exotel IVR Engine - Supabase Edge Functions
 
-Standalone Supabase Edge Functions for initiating outbound IVR calls via the
-Exotel Voice v1 API and for serving the dynamic call flow.
+Supabase Edge Functions for initiating outbound IVR calls via the Exotel
+Voice v1 API and for serving the dynamic call flow.
+
+**This is no longer a standalone prototype.** The "order" the whole flow
+revolves around is a row in **mjunction**'s own `recipients` table — the
+same admin panel that manages the recipient lifecycle. Both projects are
+linked to the same Supabase project, so this repo reads and writes
+`recipients` / `call_attempts` / `recipient_events` directly; there is no
+separate `orders` table anymore. A real IVR call updates the exact same
+status, call history and timeline the mjunction admin panel shows for a
+mock call — see "How the order id flows through the call" below.
 
 ## Project Structure
 
 `supabase/functions/ivr-engine/` — starts outbound calls
-- `index.ts` - entry point, validates the order, records the CallSid mapping
+- `index.ts` - entry point: resolves the recipient, bootstraps its status,
+  opens a `call_attempts` row, then calls Exotel
 - `exotel.ts` - Exotel Voice v1 `Calls/connect` logic
 
 `supabase/functions/dynamic-greeting/` — serves the live call flow to Exotel
@@ -17,39 +27,64 @@ Exotel Voice v1 API and for serving the dynamic call flow.
 - `config.ts` - resolves the support number + connect settings (env now, DB later)
 - `exotel.ts` - maps that config onto Exotel's Connect response schema
 
+`supabase/functions/update-order-status/` — sole owner of the `recipients` /
+`call_attempts` write
+- `index.ts` - finalizes a call's outcome (from a DTMF digit or an explicit
+  outcome) and applies the resulting recipient status transition
+
+`supabase/functions/status-callback/` — Exotel `StatusCallback` receiver
+- `index.ts` - captures the recording URL and finalizes calls that never
+  reached a menu (no-answer/busy/failed)
+
 `supabase/functions/_shared/`
-- `orders.ts` - order lookups, call logging, timeout guard (used by all)
+- `orders.ts` - recipient lookups, call_attempts lifecycle, call logging,
+  timeout guard (used by all)
+- `status.ts` - the recipient status machine, hand-kept in sync with
+  mjunction's `src/lib/domain/status.ts`
+- `logging.ts` - structured per-request console logging
 
 ## How the order id flows through the call
 
-The order id is the single input to the whole flow. It is supplied once, when the
+The order id — a recipient's stable `unique_id` in mjunction's `recipients`
+table — is the single input to the whole flow. It is supplied once, when the
 call is placed, and Exotel carries it through every applet:
 
 ```
-POST /ivr-engine  { "orderId": "ORD12345" }
+POST /ivr-engine  { "orderId": "<recipients.unique_id>" }
         │
-        │  ivr-engine loads the order, then calls Exotel Calls/connect
-        │  with CustomField=ORD12345
+        │  ivr-engine resolves the recipient, bootstraps its status to
+        │  order_confirm_pending, opens a call_attempts row, then calls
+        │  Exotel Calls/connect with CustomField=<unique_id>
         ▼
 Exotel dials the customer and runs the flow
         │
         │  Exotel echoes CustomField on every applet request
         ▼
-GET /dynamic-greeting?step=welcome&CustomField=ORD12345&CallSid=...
+GET /dynamic-greeting?step=welcome&CustomField=<unique_id>&CallSid=...
         │
         ▼
-prompt built from that order's customer_name, product_name, delivery_address
+prompt built from that recipient's customer_name, product_name, address
+        │
+        │  the terminal Gather step (or, if the call never gets that far,
+        │  Exotel's StatusCallback) finalizes the call_attempts row and
+        │  transitions recipients.status
+        ▼
+mjunction's admin panel shows the updated status, call history and timeline
+— no changes needed on that side, it already reads these same tables.
 ```
 
-`dynamic-greeting` resolves the order in three steps, most reliable first:
+`dynamic-greeting` resolves the recipient in three steps, most reliable first:
 
 1. **`CustomField`** — the order id `ivr-engine` passed to `Calls/connect`.
    Exotel echoes it to every applet, so this is the normal path.
-2. **`CallSid`** — `ivr-engine` also stores the CallSid to order mapping in
-   `ivr_logs` when it places the call, covering any request that arrives without
-   a CustomField.
-3. **Caller number** — the only option for an inbound call, which never carries a
-   CustomField.
+2. **`CallSid`** — `ivr-engine` also stores the CallSid to order (and
+   call_attempts) mapping in `ivr_logs` when it places the call, covering any
+   request that arrives without a CustomField.
+3. **Caller number** — the only option for an inbound call, which never
+   carries a CustomField. Matched against `recipients.contact_no_e164`; since
+   the same phone number can legitimately belong to more than one recipient
+   across campaigns, this path is a best-effort "most recently updated wins",
+   not a guaranteed-unique match.
 
 If none resolve, the prompts degrade to generic wording rather than failing, so
 the call still completes.
@@ -58,20 +93,20 @@ the call still completes.
 
 | Field | Required | Notes |
 | --- | --- | --- |
-| `orderId` | **yes** | Must exist in `orders`; 404 otherwise |
-| `phoneNumber` | no | Defaults to the order's `phone_number` |
-| `statusCallbackUrl` | no | Subscribes to Exotel's `terminal` event |
-| `record` | no | Defaults to `false` |
+| `orderId` | **yes** | Must be a `recipients.unique_id`; 404 otherwise |
+| `phoneNumber` | no | Defaults to the recipient's `contact_no_e164` |
+| `statusCallbackUrl` | no | Defaults to this project's own `status-callback` function; override only to point at a different receiver |
+| `record` | no | Defaults to `false` — pass `true` to actually get a `RecordingUrl` back on `status-callback`. Left off by default, matching Exotel's own default and this repo's general caution around toggles that can affect call delivery; flip it once you've confirmed call recording is enabled on the Exotel account |
 
 ```bash
 curl -X POST "$FUNCTIONS_URL/ivr-engine" \
   -H 'Content-Type: application/json' \
-  -d '{"orderId":"ORD12345"}'
+  -d '{"orderId":"<recipients.unique_id>","record":true}'
 ```
 
 Returns `{ success, callSid, status, orderId, phoneNumber }`. A 200 means Exotel
 accepted the request, not that the call connected — the outcome arrives via
-`StatusCallback` or the Call Details API. Statuses: `queued`, `in-progress`,
+the Gather flow finishing or via `status-callback`. Statuses: `queued`, `in-progress`,
 `completed`, `failed`, `busy`, `no-answer`.
 
 Errors: 400 missing `orderId`, 404 unknown `orderId`, 422 no phone number
@@ -79,19 +114,31 @@ available, 405 wrong method, 503 Exotel env vars missing, 502 Exotel rejected it
 
 ## Database prerequisites
 
-`dynamic-greeting` reads `orders` and writes `ivr_logs`. Both are created by
-`supabase/migrations/0004_ivr_runtime.sql`, which also adds the unique indexes
-the function's `.maybeSingle()` lookup and `.upsert({ onConflict: "call_sid" })`
-depend on, plus the `service_role` GRANTs the Data API needs.
+`dynamic-greeting` / `update-order-status` / `status-callback` read and write
+`recipients`, `call_attempts` and `recipient_events` — **mjunction's** tables,
+created by *that* repo's migrations (`0001_init.sql` etc.), not this one's.
+This repo's own migrations only cover `ivr_logs` / `ivr_call_events`
+(`0004_ivr_runtime.sql`, `0005_ivr_call_events.sql`) and the link between them
+(`0006_ivr_logs_call_attempt_link.sql`, adding `ivr_logs.call_attempt_id`).
 
-Apply migrations before pointing Exotel at the function:
+**This means `supabase db reset` from this repo alone is no longer enough for
+a fresh environment.** mjunction's migrations must be applied to the same
+project first (or already have been — on the shared project they already are).
+`ivr_logs.call_attempt_id` is deliberately a plain `uuid` column, not a foreign
+key, precisely because this repo's own reset must not hard-fail just because
+`call_attempts` doesn't exist yet in a database that has never seen
+mjunction's migrations.
+
+Apply this repo's migrations before pointing Exotel at the function:
 
 ```bash
 supabase db reset
 ```
 
-Without this migration every PostgREST call fails (`PGRST205` / `42501`), the
-greeting announces the hardcoded fallback order id, and nothing is logged.
+Without them every PostgREST call to `ivr_logs`/`ivr_call_events` fails
+(`PGRST205` / `42501`) and nothing gets logged — but the recipient/call_attempts
+writes will *also* fail (`PGRST205`) on any database that hasn't separately had
+mjunction's own migrations applied.
 
 ## Environment Variables / Secrets
 
@@ -122,8 +169,10 @@ rest are optional and fall back to the defaults in `connect-support/config.ts`:
   `SUPPORT_MAX_CONVERSATION_DURATION` (default `900`, max `4500`),
   `SUPPORT_MUSIC_ON_HOLD_TYPE` (default `default_tone`), `SUPPORT_WAIT_MESSAGE`,
   `SUPPORT_FETCH_AFTER_ATTEMPT` (default `false`),
-  `SUPPORT_CONNECT_STATUS` (order status written on transfer, default
-  `issue_raised`; set empty to disable the status update).
+  `SUPPORT_CONNECT_STATUS` (the `call_attempts.outcome` value recorded on
+  transfer — a value from the `call_outcome` enum, not a recipient status;
+  default `transferred_to_agent`, which is what the escalations queue's
+  order-type filter looks for; set empty to disable the update).
 
 `supabase start` has no `--env-file` flag — `env(...)` in `config.toml` is
 resolved from the **process environment**, so the file must be exported into the
@@ -163,6 +212,13 @@ which is why `step=address` records the answer to the order question, and
 `step=done` records the answer to the address question.
 
 Any unrecognised `step` now returns a valid closing message rather than a 404.
+
+`status-callback` is **not** wired into the Exotel flow builder like the
+applets above — it is not an applet at all. `ivr-engine` passes it as the
+`StatusCallback` URL on the `Calls/connect` request itself (subscribed to the
+`terminal` event), so Exotel calls it automatically once per call, with no
+Exotel-side configuration needed. See "Call recording & terminal status"
+below.
 
 ### Transferring to a live agent (Connect applet)
 
@@ -211,11 +267,11 @@ context it needs to route.
 If no number is configured the endpoint returns HTTP 500 (not a broken 200), so
 Exotel runs its configured fallback instead of bridging the caller to dead air.
 
-When it serves a number, `connect-support` also marks the order — status
-`issue_raised` by default (`SUPPORT_CONNECT_STATUS`) — by calling
+When it serves a number, `connect-support` also records this call's outcome —
+`transferred_to_agent` by default (`SUPPORT_CONNECT_STATUS`) — by calling
 `update-order-status` fire-and-forget, the same way `dynamic-greeting` does. It
-never writes to `orders` directly; that write stays owned by one function. The
-update is skipped for inbound calls that carry no order id.
+never writes to `recipients` / `call_attempts` directly; that write stays owned
+by one function. The update is skipped for inbound calls that carry no order id.
 
 All four are **Gather** applets. The closing messages are Gather applets too,
 not Greeting applets — a Greeting applet's dynamic URL expects a different body
@@ -241,27 +297,66 @@ default order id. Audit writes go to `EdgeRuntime.waitUntil` so they never block
 the reply. Measured: ~15-25ms warm, under 0.2s cold, 1.5s worst case with the
 database completely unreachable.
 
+## Call recording & terminal status
+
+`ivr-engine` subscribes every call it places to its own `status-callback`
+function (via `StatusCallback` + `StatusCallbackEvents[0]=terminal` on the
+`Calls/connect` request), so Exotel POSTs there once when a call reaches a
+final state. That function does two things, both safe to run more than once
+for the same call:
+
+1. **Attaches the recording URL.** If Exotel sent a `RecordingUrl` (only
+   present when the call was recorded and answered — see the `record` flag
+   above), it's written straight onto that call's `call_attempts.recording_url`
+   as-is. This is a bare external Exotel URL, not something re-hosted into
+   Supabase Storage — mjunction's recipient detail page links straight out to
+   it.
+2. **Finalizes calls that never reached a menu.** If the Gather flow never
+   got the chance to record an outcome (`no-answer` / `busy` / `failed`), this
+   is the only signal there is, so it finalizes the call_attempts row from the
+   terminal status alone and transitions the recipient to `order_unreachable`.
+   A call that *did* complete the Gather flow already has a real outcome by
+   the time this fires, so it is never overwritten with a generic one.
+
 ## How to Deploy
 
 ```bash
 # Set production secrets
 supabase secrets set --env-file ./supabase/.env.local
 
-# Push the database migrations
+# Push the database migrations (mjunction's own migrations must already be
+# applied to this project — see "Database prerequisites" above)
 supabase db push
 
 # Deploy the functions
 supabase functions deploy ivr-engine --use-api
 supabase functions deploy dynamic-greeting --use-api
 supabase functions deploy connect-support --use-api
+supabase functions deploy update-order-status --use-api
+supabase functions deploy status-callback --use-api
 ```
 
 ## Integration notes
 
-To integrate this IVR Engine into the existing application, the following
-changes were made:
+**Current state:** this repo's edge functions are the only thing that
+actually places and drives a real Exotel call, and they write directly to
+mjunction's `recipients` / `call_attempts` / `recipient_events` tables (same
+Supabase project, so no API call between the two repos is needed for that).
+A recipient's status now updates progressively over the life of one call —
+`imported → order_confirm_pending` the moment the call is dialed, then to
+`address_confirmed` / `order_unreachable` (or left at `order_confirm_pending`
+for an address correction or agent transfer, matching mjunction's own
+`recordOrderConfirmationCall` mapping) once the outcome is known — rather than
+only once at the very end.
 
-- Registered `ExotelProvider` in the Telephony Provider abstraction.
-- Added Exotel environment variables.
-- Updated the webhook route to process Exotel callbacks.
-- Invoked the Supabase Edge Function from the provider layer.
+**Not yet done, and out of scope for this change:** mjunction's own
+`TelephonyProvider` abstraction (`src/lib/telephony/`) has no `ExotelProvider`
+— `TELEPHONY_PROVIDER` is still hardcoded to `mock`, and mjunction's "Call Now"
+button in the admin panel does not call this repo's `/ivr-engine` endpoint.
+Wiring that up is a separate, larger piece of work: mjunction's
+`PlaceCallInput`/`PlaceCallResult` contract assumes a call resolves
+synchronously (fits a mock call, not a real one that plays out over many
+independent Exotel requests), and `app/api/telephony/webhook/route.ts` is
+still the original Phase-1 stub. Until that lands, a real call has to be
+triggered directly against this repo's `/ivr-engine` endpoint (e.g. from a
+script, or a temporary admin action) rather than from the mjunction UI.

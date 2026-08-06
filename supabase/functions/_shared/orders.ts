@@ -1,11 +1,28 @@
 /**
  * Shared data access for the IVR functions.
  *
- * Both `ivr-engine` (call initiation) and `dynamic-greeting` (prompt
- * construction) need the same order lookups and the same call-log table, so the
- * client and queries live here rather than being duplicated.
+ * The "order" this whole flow revolves around IS a recipient row in
+ * mjunction's own `recipients` table — the same table the admin panel
+ * (mjunction) reads and writes. There is no separate `orders` table anymore:
+ * a recipient's stable `unique_id` is what travels through Exotel as
+ * `CustomField`/`orderId`, and a call against it writes to the exact same
+ * `call_attempts` / `recipient_events` / `recipients.status` that a mock call
+ * placed from the admin panel would. That is what makes a recipient's
+ * timeline, escalations queue and unreachable queue pick up real IVR activity
+ * with zero changes on the mjunction side.
+ *
+ * `ivr_logs` / `ivr_call_events` (this repo's own tables) remain the
+ * granular, per-applet-request technical trace — useful for diagnosing a
+ * misconfigured Exotel flow — separate from the business-level record that
+ * lives in `call_attempts`.
  */
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import {
+  canTransition,
+  type CallOutcome,
+  orderConfirmationStatusFor,
+  type RecipientStatus,
+} from "./status.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "http://127.0.0.1:54321";
 // Server-to-server: no end-user session exists, so use the service-role key.
@@ -23,17 +40,41 @@ export function db(): SupabaseClient | null {
   return cached;
 }
 
+/** Build a same-project functions URL, e.g. for a default StatusCallback. */
+export function functionsUrl(name: string): string {
+  return `${supabaseUrl.replace(/\/$/, "")}/functions/v1/${name}`;
+}
+
+export type { CallOutcome, RecipientStatus };
+
+/**
+ * The "order" as seen by the IVR flow. Field names are kept in the vocabulary
+ * Exotel/the call script already uses (order_id, delivery_address, ...) even
+ * though every one of them is now a `recipients` column under a different
+ * name — that mapping lives here and nowhere else.
+ */
 export interface OrderRecord {
   order_id: string;
   phone_number: string;
   customer_name: string | null;
   delivery_address: string | null;
   product_name: string | null;
-  status: string | null;
+  status: RecipientStatus;
+  /** Internal — `recipients.id`, needed for every write below. */
+  recipient_id: string;
+  campaign_id: string;
 }
 
-const ORDER_COLUMNS =
-  "order_id, phone_number, customer_name, delivery_address, product_name, status";
+const RECIPIENT_COLUMNS = [
+  "order_id:unique_id",
+  "phone_number:contact_no_e164",
+  "customer_name",
+  "delivery_address:address",
+  "product_name",
+  "status",
+  "recipient_id:id",
+  "campaign_id",
+].join(", ");
 
 /**
  * Exotel abandons an application URL that has not answered within 5 seconds and
@@ -68,10 +109,11 @@ export interface OrderLookup {
 }
 
 /**
- * Look up an order, keeping "does not exist" distinguishable from "the query
- * failed". Callers that must report the real fault (ivr-engine) use this;
- * callers that must never drop a live call (dynamic-greeting) use
- * `getOrderById`, which collapses both cases to null on purpose.
+ * Look up the recipient this order id resolves to, keeping "does not exist"
+ * distinguishable from "the query failed". Callers that must report the real
+ * fault (ivr-engine) use this; callers that must never drop a live call
+ * (dynamic-greeting) use `getOrderById`, which collapses both cases to null
+ * on purpose.
  */
 export async function lookupOrderById(orderId: string): Promise<OrderLookup> {
   const client = db();
@@ -80,9 +122,9 @@ export async function lookupOrderById(orderId: string): Promise<OrderLookup> {
   }
 
   const { data, error } = await client
-    .from("orders")
-    .select(ORDER_COLUMNS)
-    .eq("order_id", orderId)
+    .from("recipients")
+    .select(RECIPIENT_COLUMNS)
+    .eq("unique_id", orderId)
     .maybeSingle();
 
   if (error) {
@@ -90,7 +132,7 @@ export async function lookupOrderById(orderId: string): Promise<OrderLookup> {
     return { order: null, error: `${error.code}: ${error.message}` };
   }
 
-  return { order: (data as OrderRecord | null) ?? null, error: null };
+  return { order: (data as unknown as OrderRecord | null) ?? null, error: null };
 }
 
 /** Primary path: the order id travelled with the call via Exotel CustomField. */
@@ -100,9 +142,15 @@ export async function getOrderById(orderId: string): Promise<OrderRecord | null>
 }
 
 /**
- * Inbound-call path: no CustomField exists, so fall back to the caller's number.
- * Callers arrive as `08116411177`, `8116411177` or `+918116411177` depending on
- * the circuit, so match on the last 10 digits.
+ * Inbound-call path: no CustomField exists, so fall back to the caller's
+ * number. Callers arrive as `08116411177`, `8116411177` or `+918116411177`
+ * depending on the circuit, so match on the last 10 digits.
+ *
+ * A phone number is only unique per-campaign in `recipients` (the same
+ * person can legitimately be a recipient in two campaigns), so a phone-only
+ * match can be genuinely ambiguous. Most-recently-updated wins — the
+ * recipient most likely to be the subject of a callback — rather than an
+ * arbitrary row order.
  */
 export async function getOrderByPhone(phone: string): Promise<OrderRecord | null> {
   const client = db();
@@ -112,10 +160,11 @@ export async function getOrderByPhone(phone: string): Promise<OrderRecord | null
   if (!national) return null;
 
   const { data, error } = await client
-    .from("orders")
-    .select(ORDER_COLUMNS)
+    .from("recipients")
+    .select(RECIPIENT_COLUMNS)
     // PostgREST uses `*` as the LIKE wildcard in filter strings, not `%`.
-    .or(`phone_number.eq.${phone},phone_number.like.*${national}`)
+    .or(`contact_no_e164.eq.${phone},contact_no_e164.like.*${national}`)
+    .order("updated_at", { ascending: false })
     .limit(1)
     .maybeSingle();
 
@@ -123,7 +172,7 @@ export async function getOrderByPhone(phone: string): Promise<OrderRecord | null
     console.error("[getOrderByPhone] failed:", error.code, error.message);
     return null;
   }
-  return (data as OrderRecord | null) ?? null;
+  return (data as unknown as OrderRecord | null) ?? null;
 }
 
 /**
@@ -148,6 +197,26 @@ export async function getOrderIdByCallSid(callSid: string): Promise<string | nul
   return data?.order_id ?? null;
 }
 
+/** Fresh read of a recipient's current status, used just before finalizing a call. */
+export async function getRecipientStatus(
+  recipientId: string,
+): Promise<RecipientStatus | null> {
+  const client = db();
+  if (!client || !recipientId) return null;
+
+  const { data, error } = await client
+    .from("recipients")
+    .select("status")
+    .eq("id", recipientId)
+    .maybeSingle();
+
+  if (error) {
+    console.error("[getRecipientStatus] failed:", error.code, error.message);
+    return null;
+  }
+  return (data?.status as RecipientStatus | undefined) ?? null;
+}
+
 export interface CallLogEntry {
   callSid: string;
   callerNumber?: string;
@@ -157,6 +226,8 @@ export interface CallLogEntry {
   status: string;
   /** Which applet Exotel appears to have called from; recorded for diagnosis. */
   appletHint?: string;
+  /** Links this call_sid to the call_attempts row it belongs to (see startCallAttempt). */
+  callAttemptId?: string;
 }
 
 export async function upsertCallLog(entry: CallLogEntry): Promise<void> {
@@ -170,9 +241,10 @@ export async function upsertCallLog(entry: CallLogEntry): Promise<void> {
     user_input: entry.userInput ?? "none",
     updated_at: new Date().toISOString(),
   };
-  // Never overwrite a known caller/order with undefined on a later step.
+  // Never overwrite a known caller/order/attempt with undefined on a later step.
   if (entry.callerNumber) row.caller_number = entry.callerNumber;
   if (entry.orderId) row.order_id = entry.orderId;
+  if (entry.callAttemptId) row.call_attempt_id = entry.callAttemptId;
 
   const { error } = await client
     .from("ivr_logs")
@@ -210,7 +282,10 @@ export function logCallStep(entry: CallLogEntry): void {
   const task = upsertCallLog(entry).catch((err) => {
     console.error("[logCallStep] threw:", err);
   });
+  waitUntil(task);
+}
 
+function waitUntil(task: Promise<unknown>): void {
   const runtime = (globalThis as {
     EdgeRuntime?: { waitUntil?: (p: Promise<unknown>) => void };
   }).EdgeRuntime;
@@ -218,81 +293,395 @@ export function logCallStep(entry: CallLogEntry): void {
   if (runtime?.waitUntil) runtime.waitUntil(task);
 }
 
-// ---------------------------------------------------------------------------
-// Order status updates — written by `update-order-status`, triggered by
-// `dynamic-greeting`.
-//
-// dynamic-greeting resolves the order and plays prompts but is not allowed to
-// write to `orders` itself; a separate function owns that write so the two
-// responsibilities (IVR flow vs. state mutation) stay independent and can be
-// redeployed/audited separately.
-// ---------------------------------------------------------------------------
+/**
+ * The digit pressed on an earlier Gather menu arrives with the *next*
+ * applet's request (Exotel's echo-on-next-request behaviour — see the
+ * dynamic-greeting header comment). By the time the call reaches its last
+ * step, that earlier digit only survives in the append-only `ivr_call_events`
+ * trace (`ivr_logs` has already been overwritten with the latest step). This
+ * reads it back so the final outcome can take both answers into account.
+ */
+export async function getPriorStepInput(
+  callSid: string,
+  step: string,
+): Promise<string> {
+  const client = db();
+  if (!client || !callSid) return "";
 
-/** Only these two DTMF values represent a final decision worth persisting. */
-export const DTMF_STATUS_MAP: Record<string, string> = {
-  "1": "confirmed",
-  "2": "support_requested",
-};
+  const { data, error } = await withTimeout(
+    client
+      .from("ivr_call_events")
+      .select("user_input")
+      .eq("call_sid", callSid)
+      .eq("step", step)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+    { data: null, error: null },
+    "getPriorStepInput",
+  );
 
-export interface OrderStatusUpdateResult {
-  success: boolean;
-  error?: string;
+  if (error) {
+    console.error("[getPriorStepInput] failed:", error.code, error.message);
+    return "";
+  }
+  const input = (data as { user_input?: string } | null)?.user_input;
+  return input && input !== "none" ? input : "";
 }
 
 /**
- * Direct DB write, used inside the `update-order-status` function itself.
- * Distinguishes "no such order" from "the query failed" in the log, but both
- * collapse to `success: false` for the caller — Exotel only needs to know
- * whether to move on, not why.
+ * Order-confirmation outcome from the two Gather answers (welcome-menu digit,
+ * address-menu digit). A reported address problem wins over an order-level
+ * "press 2" — it is the more specific, more actionable signal — otherwise an
+ * order-level issue routes to `transferred_to_agent`, otherwise it's a clean
+ * confirm. Matches the wording the call script and OUTCOME_LABELS (mjunction)
+ * already commit to: outcome `confirmed` = "press 1", `corrected` = "press 2".
  */
-export async function updateOrderStatus(
-  orderId: string,
-  status: string,
-): Promise<OrderStatusUpdateResult> {
+export function resolveOrderConfirmationOutcome(
+  welcomeDigit: string,
+  addressDigit: string,
+): CallOutcome {
+  if (addressDigit === "2") return "corrected";
+  if (welcomeDigit === "2") return "transferred_to_agent";
+  return "confirmed";
+}
+
+// ---------------------------------------------------------------------------
+// call_attempts lifecycle — the same table + shape the mock provider writes
+// (src/lib/domain/call-flow.ts in mjunction), just opened at dial time and
+// finalized later instead of written in one shot, because a live Exotel call
+// spans many independent HTTP requests instead of one synchronous function
+// call.
+// ---------------------------------------------------------------------------
+
+export type CallType = "order_confirmation" | "delivery_confirmation";
+
+export interface StartedCallAttempt {
+  /** call_attempts.id — a uuid, same as every other primary key in mjunction's schema. */
+  id: string;
+  attemptNumber: number;
+}
+
+/**
+ * Open a call_attempts row when the call is placed. `attempt_number` mirrors
+ * `nextAttemptNumber` in mjunction's `app/actions/calls.ts`: count existing
+ * attempts of this call_type for this recipient, +1.
+ */
+export async function startCallAttempt(params: {
+  recipientId: string;
+  campaignId: string;
+  callType: CallType;
+}): Promise<StartedCallAttempt | null> {
   const client = db();
-  if (!client) {
-    return { success: false, error: "No Supabase key configured" };
+  if (!client) return null;
+
+  const { count, error: countError } = await client
+    .from("call_attempts")
+    .select("*", { count: "exact", head: true })
+    .eq("recipient_id", params.recipientId)
+    .eq("call_type", params.callType);
+
+  if (countError) {
+    console.error("[startCallAttempt] count failed:", countError.code, countError.message);
   }
+  const attemptNumber = (count ?? 0) + 1;
 
   const { data, error } = await client
-    .from("orders")
-    .update({ status, updated_at: new Date().toISOString() })
-    .eq("order_id", orderId)
-    .select("order_id")
+    .from("call_attempts")
+    .insert({
+      recipient_id: params.recipientId,
+      campaign_id: params.campaignId,
+      call_type: params.callType,
+      attempt_number: attemptNumber,
+      provider: "exotel",
+      caller_type: "ivr",
+      started_at: new Date().toISOString(),
+    })
+    .select("id")
+    .single();
+
+  if (error || !data) {
+    console.error("[startCallAttempt] insert failed:", error?.code, error?.message);
+    return null;
+  }
+
+  return { id: data.id as string, attemptNumber };
+}
+
+export interface OpenCallAttempt {
+  /** call_attempts.id — a uuid. */
+  id: string;
+  recipientId: string;
+  campaignId: string;
+  callType: CallType;
+  attemptNumber: number;
+  /** Null until finalizeCallAttempt has run — callers use this to tell "still open" from "already finalized". */
+  outcome: CallOutcome | null;
+}
+
+/**
+ * Recover the call_attempts row for a call_sid — needed by every step after
+ * the one that placed the call, since none of them carry the call_attempts
+ * id directly. Resolves through `ivr_logs.call_attempt_id`, stamped there by
+ * `startCallAttempt`'s caller via `upsertCallLog`. Despite the name, this can
+ * return an already-finalized attempt too (its `outcome` will be non-null) —
+ * callers that must not finalize twice (status-callback) check that field.
+ */
+export async function getOpenCallAttemptByCallSid(
+  callSid: string,
+): Promise<OpenCallAttempt | null> {
+  const client = db();
+  if (!client || !callSid) return null;
+
+  const { data: logRow, error: logError } = await client
+    .from("ivr_logs")
+    .select("call_attempt_id")
+    .eq("call_sid", callSid)
+    .maybeSingle();
+
+  if (logError) {
+    console.error("[getOpenCallAttemptByCallSid] ivr_logs lookup failed:", logError.code, logError.message);
+    return null;
+  }
+  if (!logRow?.call_attempt_id) return null;
+
+  const { data, error } = await client
+    .from("call_attempts")
+    .select("id, recipient_id, campaign_id, call_type, attempt_number, outcome")
+    .eq("id", logRow.call_attempt_id)
     .maybeSingle();
 
   if (error) {
-    console.error("[updateOrderStatus] failed:", error.code, error.message);
-    return { success: false, error: `${error.code}: ${error.message}` };
+    console.error("[getOpenCallAttemptByCallSid] call_attempts lookup failed:", error.code, error.message);
+    return null;
   }
+  if (!data) return null;
 
-  if (!data) {
-    console.warn(`[updateOrderStatus] no order matched order_id="${orderId}"`);
-    return { success: false, error: `Order not found: ${orderId}` };
-  }
-
-  return { success: true };
+  return {
+    id: data.id as string,
+    recipientId: data.recipient_id as string,
+    campaignId: data.campaign_id as string,
+    callType: data.call_type as CallType,
+    attemptNumber: data.attempt_number as number,
+    outcome: (data.outcome as CallOutcome | null) ?? null,
+  };
 }
+
+/**
+ * Attach Exotel's recording URL (+ CallSid, for cross-referencing) to a
+ * call_attempts row. Separate from `finalizeCallAttempt` because the
+ * recording only becomes known once Exotel's StatusCallback fires — which
+ * can be well after the Gather flow already finalized the outcome, or can be
+ * the only signal at all for a call that never answered.
+ */
+export async function attachCallRecording(params: {
+  callAttemptId: string;
+  recordingUrl: string;
+  providerCallRef: string;
+}): Promise<void> {
+  const client = db();
+  if (!client) return;
+
+  const { error } = await client
+    .from("call_attempts")
+    .update({
+      recording_url: params.recordingUrl,
+      provider_call_ref: params.providerCallRef,
+    })
+    .eq("id", params.callAttemptId);
+
+  if (error) {
+    console.error("[attachCallRecording] update failed:", error.code, error.message);
+  }
+}
+
+/**
+ * Exotel's terminal call status -> outcome, for a call that never reached a
+ * Gather step at all (so there is no digit to derive an outcome from — this
+ * is the only signal). `null` for anything that isn't a clean "never
+ * connected" — notably `completed`, which just means the call ended, not
+ * that it ended *without* a Gather outcome; a call_attempts row with a
+ * recording but no outcome is an honest state, not a bug, when the caller
+ * hung up mid-menu.
+ */
+export function terminalStatusOutcome(exotelStatus: string): CallOutcome | null {
+  switch (exotelStatus.trim().toLowerCase()) {
+    case "no-answer":
+    case "no_answer":
+      return "no_answer";
+    case "busy":
+    case "failed":
+    case "canceled":
+    case "cancelled":
+      return "not_reachable";
+    default:
+      return null;
+  }
+}
+
+/** Append a row to the recipient's timeline — same shape as mjunction's own `logEvent`. */
+export async function logRecipientEvent(params: {
+  recipientId: string;
+  eventType: string;
+  payload?: Record<string, unknown>;
+}): Promise<void> {
+  const client = db();
+  if (!client) return;
+
+  const { error } = await client.from("recipient_events").insert({
+    recipient_id: params.recipientId,
+    event_type: params.eventType,
+    actor_type: "ivr",
+    payload: params.payload ?? {},
+  });
+
+  if (error) {
+    console.error("[logRecipientEvent] failed:", error.code, error.message);
+  }
+}
+
+/**
+ * Validate + apply a status transition — the Deno-side equivalent of
+ * mjunction's `transitionStatus` (src/lib/domain/audit.ts). Differs in one
+ * way on purpose: this is always fire-and-forget server-to-server code with
+ * no one watching for a thrown error, so an illegal transition is logged and
+ * skipped rather than thrown, matching this repo's existing "never let a
+ * write error take down the call" posture.
+ */
+export async function transitionRecipientStatus(params: {
+  recipientId: string;
+  from: RecipientStatus;
+  to: RecipientStatus;
+  payload?: Record<string, unknown>;
+}): Promise<void> {
+  if (params.from === params.to) return;
+  if (!canTransition(params.from, params.to)) {
+    console.warn(
+      `[transitionRecipientStatus] illegal transition ${params.from} -> ${params.to} for recipient ${params.recipientId}; skipped`,
+    );
+    return;
+  }
+
+  const client = db();
+  if (!client) return;
+
+  const { error } = await client
+    .from("recipients")
+    .update({ status: params.to, updated_at: new Date().toISOString() })
+    .eq("id", params.recipientId);
+
+  if (error) {
+    console.error("[transitionRecipientStatus] update failed:", error.code, error.message);
+    return;
+  }
+
+  await logRecipientEvent({
+    recipientId: params.recipientId,
+    eventType: "status_change",
+    payload: { from: params.from, to: params.to, ...(params.payload ?? {}) },
+  });
+}
+
+export interface FinalizeCallAttemptParams {
+  callAttemptId: string;
+  recipientId: string;
+  from: RecipientStatus;
+  callType: CallType;
+  attemptNumber: number;
+  outcome: CallOutcome;
+  dtmfResponse?: string | null;
+}
+
+/**
+ * Close out a call_attempts row and apply its consequences: a `call_attempt`
+ * timeline event (always) and, for order-confirmation calls, the resulting
+ * recipient status transition (per `orderConfirmationStatusFor` — a reported
+ * address issue or an agent transfer deliberately leaves the recipient at
+ * `order_confirm_pending`; only a clean confirm or a fully-unreachable call
+ * advances it). Called once the call's outcome is known, whether that is
+ * because the caller finished the Gather flow or because Exotel's
+ * StatusCallback reported the call never connected.
+ */
+export async function finalizeCallAttempt(
+  params: FinalizeCallAttemptParams,
+): Promise<void> {
+  const client = db();
+  if (!client) return;
+
+  const { error } = await client
+    .from("call_attempts")
+    .update({
+      outcome: params.outcome,
+      dtmf_response: params.dtmfResponse ?? null,
+      ended_at: new Date().toISOString(),
+    })
+    .eq("id", params.callAttemptId);
+
+  if (error) {
+    console.error("[finalizeCallAttempt] update failed:", error.code, error.message);
+  }
+
+  await logRecipientEvent({
+    recipientId: params.recipientId,
+    eventType: "call_attempt",
+    payload: {
+      call_type: params.callType,
+      attempt_number: params.attemptNumber,
+      dtmf: params.dtmfResponse ?? null,
+      outcome: params.outcome,
+      caller_type: "ivr",
+    },
+  });
+
+  if (params.callType === "order_confirmation") {
+    const to = orderConfirmationStatusFor(params.outcome, params.from);
+    if (to !== params.from) {
+      await transitionRecipientStatus({
+        recipientId: params.recipientId,
+        from: params.from,
+        to,
+        payload: { via: "order_confirmation", outcome: params.outcome },
+      });
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-function notification — written by `update-order-status`, triggered
+// by `dynamic-greeting` (Gather flow finished) and `connect-support` (agent
+// transfer).
+//
+// dynamic-greeting/connect-support know which call_sid this is and (at most)
+// the single digit their own step just collected, but are not allowed to
+// write to `recipients` / `call_attempts` themselves, and must not add a
+// blocking DB read to their own response — every millisecond there counts
+// against Exotel's 5s abandon timer. So the actual outcome resolution
+// (combining this digit with an earlier one, via `getPriorStepInput` +
+// `resolveOrderConfirmationOutcome`) happens inside `update-order-status`
+// instead, which runs after the Exotel response has already gone out. That
+// keeps the two responsibilities (IVR flow vs. state mutation) independent
+// and redeployable on their own, same as before.
+// ---------------------------------------------------------------------------
 
 export interface OrderStatusNotification {
   orderId: string;
   callSid: string;
   callerNumber?: string;
-  /** DTMF path: a keypress mapped to a status via `DTMF_STATUS_MAP`. */
+  /** Address-menu digit — set when this notification comes from the Gather flow finishing. */
   dtmf?: string;
   /**
-   * Explicit status, for triggers that are not a keypress — e.g. a support
-   * transfer marking the order `issue_raised`. Wins over `dtmf` when both are
-   * present.
+   * Explicit outcome, for triggers that are not a keypress — e.g. a support
+   * transfer marking the call `transferred_to_agent`. Wins over `dtmf` when
+   * both are present.
    */
-  status?: string;
+  outcome?: CallOutcome;
 }
 
 /**
- * Fire-and-forget call from `dynamic-greeting` to the `update-order-status`
- * function. Uses the same `EdgeRuntime.waitUntil` pattern as `logCallStep`
- * so the HTTP call can finish after the Exotel response has already gone
- * out, without delaying it and without the isolate being torn down early.
+ * Fire-and-forget call from `dynamic-greeting`/`connect-support` to the
+ * `update-order-status` function. Uses `EdgeRuntime.waitUntil` so the HTTP
+ * call can finish after the Exotel response has already gone out, without
+ * delaying it and without the isolate being torn down early.
  *
  * The target URL is derived from `SUPABASE_URL` (already required by this
  * module) rather than a separate env var, so there is one less secret to
@@ -302,15 +691,10 @@ export interface OrderStatusNotification {
  * depth in case JWT verification is ever turned back on.
  */
 export function notifyOrderStatusUpdate(entry: OrderStatusNotification): void {
-  // Resolve the target status here so a call that has nothing to persist is
-  // never fired. An explicit status wins; otherwise the DTMF digit must map to
-  // one ("1"/"2"). Anything else is a no-op.
-  const status = entry.status?.trim() || DTMF_STATUS_MAP[entry.dtmf ?? ""];
-  if (!status) {
-    return;
-  }
+  // Nothing to resolve into an outcome — never fire an empty notification.
+  if (!entry.outcome && !entry.dtmf) return;
 
-  const targetUrl = `${supabaseUrl.replace(/\/$/, "")}/functions/v1/update-order-status`;
+  const targetUrl = functionsUrl("update-order-status");
 
   const task = fetch(targetUrl, {
     method: "POST",
@@ -318,9 +702,7 @@ export function notifyOrderStatusUpdate(entry: OrderStatusNotification): void {
       "Content-Type": "application/json",
       ...(supabaseKey ? { Authorization: `Bearer ${supabaseKey}` } : {}),
     },
-    // Send the resolved status explicitly so the receiver does not have to
-    // re-derive it from the digit.
-    body: JSON.stringify({ ...entry, status }),
+    body: JSON.stringify(entry),
   })
     .then(async (res) => {
       if (!res.ok) {
@@ -334,9 +716,5 @@ export function notifyOrderStatusUpdate(entry: OrderStatusNotification): void {
       console.error("[notifyOrderStatusUpdate] request failed:", err);
     });
 
-  const runtime = (globalThis as {
-    EdgeRuntime?: { waitUntil?: (p: Promise<unknown>) => void };
-  }).EdgeRuntime;
-
-  if (runtime?.waitUntil) runtime.waitUntil(task);
+  waitUntil(task);
 }

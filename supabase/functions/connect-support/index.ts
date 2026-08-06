@@ -1,5 +1,9 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
-import { logCallStep, notifyOrderStatusUpdate } from "../_shared/orders.ts";
+import {
+  type CallOutcome,
+  logCallStep,
+  notifyOrderStatusUpdate,
+} from "../_shared/orders.ts";
 import { logEvent } from "../_shared/logging.ts";
 import { type ConnectContext, resolveConnectConfig } from "./config.ts";
 import { buildConnectResponse } from "./exotel.ts";
@@ -139,16 +143,17 @@ export default {
         appletHint: "connect (dynamic-url)",
       });
 
-      // Mark the order as issue-raised on transfer. Fire-and-forget through
-      // update-order-status (the sole owner of the orders write), so it never
-      // eats into Exotel's 5s budget. Skipped when we have no order id (inbound
-      // call with no CustomField) or when the status update is disabled.
+      // Record the transfer as this call's outcome. Fire-and-forget through
+      // update-order-status (the sole owner of the recipients/call_attempts
+      // write), so it never eats into Exotel's 5s budget. Skipped when we have
+      // no order id (inbound call with no CustomField) or when the update is
+      // disabled.
       if (orderId && config.orderStatus) {
         notifyOrderStatusUpdate({
           orderId,
           callSid,
           callerNumber,
-          status: config.orderStatus,
+          outcome: config.orderStatus as CallOutcome,
         });
       }
 

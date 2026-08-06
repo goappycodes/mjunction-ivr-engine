@@ -469,3 +469,11 @@ enabled = true
 verify_jwt = false
 import_map = "./functions/connect-support/deno.json"
 entrypoint = "./functions/connect-support/index.ts"
+
+[functions.status-callback]
+enabled = true
+# POSTed by Exotel's StatusCallback when a call reaches a terminal state.
+# Exotel carries no JWT, same as the other applet endpoints.
+verify_jwt = false
+import_map = "./functions/status-callback/deno.json"
+entrypoint = "./functions/status-callback/index.ts"
