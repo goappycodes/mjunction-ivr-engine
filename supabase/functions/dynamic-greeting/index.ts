@@ -238,8 +238,13 @@ async function resolveOrder(
 
 function welcomePrompt(order: OrderRecord | null): string {
   if (!order) {
-    return `Welcome to mjunction. We are calling regarding your recent order.
-      Press 1 to confirm your order. Press 2 if you have any issues.`;
+    return `Welcome to mjunction.
+
+      This is an automated call regarding your recent order.
+
+      To confirm your order, please press 1.
+
+      If you would like to report an issue or speak with our customer support team, please press 2.`;
   }
 
   const greeting = order.customer_name
@@ -247,29 +252,54 @@ function welcomePrompt(order: OrderRecord | null): string {
     : "Hello.";
   const item = order.product_name ? ` for ${order.product_name}` : "";
 
-  return `${greeting} This is a call from mjunction regarding your order
-    ${spellReference(order.order_id)}${item}. Press 1 to confirm your order.
-    Press 2 if you have any issues.`;
+  return `${greeting} Welcome to mjunction.
+
+    This is an automated call regarding your order
+    ${spellReference(order.order_id)}${item}.
+
+    To confirm your order, please press 1.
+
+    If you would like to report an issue or speak with our customer support team, please press 2.`;
 }
 
 function addressPrompt(order: OrderRecord | null): string {
   if (!order?.delivery_address) {
-    return `Please confirm your delivery address. Press 1 if your address is
-      correct. Press 2 if there are any issues.`;
+    return `Please confirm your delivery address.
+
+      If your delivery address is correct, please press 1.
+
+      If there is an issue with your delivery address, please press 2.`;
   }
 
   // The order reference is spoken once, in the welcome prompt. Repeating a
   // digit-by-digit id on every step makes the call tedious to sit through.
-  return `Your order will be delivered to ${order.delivery_address}.
-    Press 1 if this address is correct. Press 2 if there are any issues.`;
+  return `Our records show your delivery address as
+
+    ${order.delivery_address}.
+
+    If this address is correct, please press 1.
+
+    If there is an issue with this address, please press 2.`;
 }
 
 function closingPrompt(_order: OrderRecord | null, issue: boolean): string {
   return issue
-    ? `Thank you. We have noted your issue and our team will contact you
-       shortly. Goodbye.`
-    : `Thank you for confirming. Your order will be delivered as scheduled.
-       Goodbye.`;
+    ? `Thank you for informing us.
+
+      Your concern has been recorded successfully.
+
+      Our customer support team will contact you shortly.
+
+      Thank you for choosing mjunction.
+
+      Goodbye.`
+    : `Thank you for confirming your order.
+
+      Your order has been successfully confirmed and will be processed according to the delivery schedule.
+
+      Thank you for choosing mjunction.
+
+      Goodbye.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -443,8 +473,11 @@ export default {
 
           const response = gather(
             welcomePrompt(order),
-            `Sorry, I didn't receive your input. Press 1 to confirm your order
-             or press 2 if you have any issues.`,
+            `We did not receive a valid response.
+
+             To confirm your order, please press 1.
+
+             To report an issue or speak with our customer support team, please press 2.`,
           );
 
           logEvent({
@@ -488,8 +521,11 @@ export default {
 
           const response = gather(
             addressPrompt(order),
-            `Sorry, I didn't receive your input. Press 1 if your address is
-             correct or press 2 if there are any issues.`,
+            `We did not receive a valid response.
+
+             If your delivery address is correct, please press 1.
+
+             If there is an issue with your delivery address, please press 2.`,
           );
 
           logEvent({
@@ -615,7 +651,17 @@ export default {
       // error so genuine bugs stay visible to non-IVR callers.
       if (isIvrPath) {
         return speak(
-          "Sorry, we are unable to process your call right now. Goodbye.",
+          `
+We apologize.
+
+We are currently unable to process your request.
+
+Please try again later or contact our customer support team for assistance.
+
+Thank you.
+
+Goodbye.
+`,
         );
       }
       return Response.json({ error: "Internal Server Error" }, { status: 500 });
