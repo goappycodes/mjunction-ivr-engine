@@ -83,7 +83,11 @@ const RECIPIENT_COLUMNS = [
 export const DB_TIMEOUT_MS = 1500;
 
 export async function withTimeout<T>(
-  work: Promise<T>,
+  // PromiseLike, not Promise: a Postgrest query builder (e.g. the chain
+  // passed in by getPriorStepInput) implements .then() but not the rest of
+  // the Promise interface, so it isn't assignable to Promise<T> even though
+  // Promise.race below accepts it natively.
+  work: PromiseLike<T>,
   fallback: T,
   label: string,
 ): Promise<T> {

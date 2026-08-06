@@ -170,7 +170,10 @@ export default {
         // doesn't pass one explicitly.
         statusCallbackUrl: body.statusCallbackUrl ??
           functionsUrl("status-callback"),
-        record: body.record,
+        // Default to true: without a recording, status-callback has no
+        // RecordingUrl to attach and the whole point of that function is
+        // moot. Still overridable per-call with an explicit `record: false`.
+        record: body.record ?? true,
       };
 
       const result = await startExotelCall(callRequest);

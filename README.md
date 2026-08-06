@@ -96,12 +96,12 @@ the call still completes.
 | `orderId` | **yes** | Must be a `recipients.unique_id`; 404 otherwise |
 | `phoneNumber` | no | Defaults to the recipient's `contact_no_e164` |
 | `statusCallbackUrl` | no | Defaults to this project's own `status-callback` function; override only to point at a different receiver |
-| `record` | no | Defaults to `false` — pass `true` to actually get a `RecordingUrl` back on `status-callback`. Left off by default, matching Exotel's own default and this repo's general caution around toggles that can affect call delivery; flip it once you've confirmed call recording is enabled on the Exotel account |
+| `record` | no | Defaults to **`true`** so `status-callback` always has a `RecordingUrl` to attach; pass `record: false` per-call to opt out. This is a plain form field on `Calls/connect` (unlike `connect-support`'s `SUPPORT_RECORD`, which is validated against Exotel's stricter Connect-applet JSON schema and documented to drop the call if wrong), so it's expected to just have no effect on an account without call recording enabled rather than reject the request — worth confirming with one real test call before relying on it, since this hasn't been verified against a live Exotel account in this change |
 
 ```bash
 curl -X POST "$FUNCTIONS_URL/ivr-engine" \
   -H 'Content-Type: application/json' \
-  -d '{"orderId":"<recipients.unique_id>","record":true}'
+  -d '{"orderId":"<recipients.unique_id>"}'
 ```
 
 Returns `{ success, callSid, status, orderId, phoneNumber }`. A 200 means Exotel
