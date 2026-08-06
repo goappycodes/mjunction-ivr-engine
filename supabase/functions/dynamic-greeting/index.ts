@@ -8,6 +8,7 @@ import {
   type OrderRecord,
   withTimeout,
 } from "../_shared/orders.ts";
+import { logEvent } from "../_shared/logging.ts";
 
 const JSON_HEADERS = {
   "Content-Type": "application/json",
@@ -40,6 +41,9 @@ function gather(text: string, repeatText?: string) {
     // valid and documented as "no finish key".
     max_input_digits: 1,
     finish_on_key: "",
+    // Known-good value. Exotel examples use <=6; a larger value (10) is outside
+    // the range Exotel reliably accepts and made it reject the Gather response,
+    // dropping the call. Keep this conservative.
     input_timeout: 5,
   };
 
@@ -59,12 +63,15 @@ function gather(text: string, repeatText?: string) {
  * the trailing dead air down.
  */
 function speak(text: string) {
-  return Response.json({
-    gather_prompt: { text: clean(text) },
-    max_input_digits: 1,
-    finish_on_key: "",
-    input_timeout: 2,
-  }, { status: 200, headers: JSON_HEADERS });
+  return Response.json(
+    {
+      gather_prompt: { text: clean(text) },
+      max_input_digits: 1,
+      finish_on_key: "",
+      input_timeout: 2,
+    },
+    { status: 200, headers: JSON_HEADERS },
+  );
 }
 
 /** Collapse whitespace so the TTS engine gets a clean single-line prompt. */
@@ -131,12 +138,39 @@ function firstOf(params: URLSearchParams, ...keys: string[]): string {
 }
 
 /**
+ * Read `step` from the URL PATH instead of the query string, e.g.
+ * `/dynamic-greeting/welcome` -> "welcome".
+ *
+ * Exotel's Dynamic URL fetch appends its own params (CallSid, CallFrom,
+ * CustomField, digits, ...) to whatever URL is configured in the applet. In
+ * practice this has been observed to REWRITE the query string rather than
+ * append to it — a configured `?step=address` arrives at this function with
+ * only Exotel's own params and no `step` at all, which is indistinguishable
+ * from a genuinely misconfigured applet. The path portion of the URL is not
+ * involved in that rewriting, so encoding the step there is immune to it.
+ * `?step=` is still read as a fallback (see stepParam below) for local
+ * testing and any applet still configured the old way.
+ */
+function stepFromPath(pathname: string): string {
+  const marker = "/dynamic-greeting";
+  const idx = pathname.indexOf(marker);
+  if (idx === -1) return "";
+  return pathname
+    .slice(idx + marker.length)
+    .replace(/^\/+|\/+$/g, "")
+    .trim()
+    .toLowerCase();
+}
+
+/**
  * Exotel documents that `digits` arrives wrapped in double quotes and must be
  * trimmed, e.g. `"1"`.
  */
 function readDigits(params: URLSearchParams): string {
-  return firstOf(params, "digits", "Digits", "dtmf", "DTMF")
-    .replace(/["\s]/g, "");
+  return firstOf(params, "digits", "Digits", "dtmf", "DTMF").replace(
+    /["\s]/g,
+    "",
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -167,21 +201,26 @@ async function resolveOrder(
     (async () => {
       if (customField) {
         const order = await getOrderById(customField);
-        if (order) return { order, orderId: order.order_id, source: "CustomField" };
-        console.warn(`[resolveOrder] CustomField "${customField}" matched no order`);
+        if (order)
+          return { order, orderId: order.order_id, source: "CustomField" };
+        console.warn(
+          `[resolveOrder] CustomField "${customField}" matched no order`,
+        );
       }
 
       if (callSid) {
         const mapped = await getOrderIdByCallSid(callSid);
         if (mapped) {
           const order = await getOrderById(mapped);
-          if (order) return { order, orderId: order.order_id, source: "CallSid" };
+          if (order)
+            return { order, orderId: order.order_id, source: "CallSid" };
         }
       }
 
       if (from) {
         const order = await getOrderByPhone(from);
-        if (order) return { order, orderId: order.order_id, source: "CallFrom" };
+        if (order)
+          return { order, orderId: order.order_id, source: "CallFrom" };
       }
 
       return { order: null, orderId: customField, source: "unresolved" };
@@ -208,7 +247,9 @@ function welcomePrompt(order: OrderRecord | null): string {
       If you would like to report an issue or speak with our customer support team, please press 2.`;
   }
 
-  const greeting = order.customer_name ? `Hello ${order.customer_name}.` : "Hello.";
+  const greeting = order.customer_name
+    ? `Hello ${order.customer_name}.`
+    : "Hello.";
   const item = order.product_name ? ` for ${order.product_name}` : "";
 
   return `${greeting} Welcome to mjunction.
@@ -265,11 +306,22 @@ function closingPrompt(_order: OrderRecord | null, issue: boolean): string {
 
 export default {
   fetch: async (req: Request) => {
+    const startedAt = Date.now();
     const url = new URL(req.url);
     const isIvrPath = url.pathname.includes("/dynamic-greeting");
 
     try {
       if (req.method === "OPTIONS") {
+        logEvent({
+          fn: "dynamic-greeting",
+          level: "success",
+          event: "options_preflight",
+          message: "CORS preflight",
+          method: req.method,
+          url: req.url,
+          status: 200,
+          durationMs: Date.now() - startedAt,
+        });
         return new Response(null, {
           headers: {
             "Access-Control-Allow-Origin": "*",
@@ -280,55 +332,91 @@ export default {
       }
 
       if (!isIvrPath) {
+        logEvent({
+          fn: "dynamic-greeting",
+          level: "warning",
+          event: "path_not_found",
+          message: `Request to unrelated path ${url.pathname}`,
+          method: req.method,
+          url: req.url,
+          status: 404,
+          durationMs: Date.now() - startedAt,
+        });
         return new Response("Not Found", { status: 404 });
       }
 
       const params = await readParams(req, url);
+      const allParams = Object.fromEntries(params.entries());
       const callSid = firstOf(params, "CallSid", "call_sid");
       const callerNumber = firstOf(params, "CallFrom", "From", "caller_number");
       const digits = readDigits(params);
-      const stepParam = (params.get("step") || "").trim().toLowerCase();
+      // Path wins over query param — see stepFromPath() for why.
+      const stepParam = stepFromPath(url.pathname) ||
+        (params.get("step") || "").trim().toLowerCase();
 
-      // A missing `step` used to mean "Passthru" and returned an empty body.
-      // That silently produced blank calls: if the bare URL is wired to a
-      // Gather applet (easy to do — Exotel appends its own params, so the
-      // configured URL looks complete without `?step=`), Exotel received zero
-      // bytes where it expected a prompt and the caller heard nothing.
+      // `step` is mandatory — no more defaulting to "welcome". The entry
+      // applet in Exotel MUST be configured to reach this function with a
+      // step, preferably via the URL path (e.g. /dynamic-greeting/welcome —
+      // see stepFromPath()), which survives Exotel rewriting the query
+      // string. This trades the old silent-fallback safety net for loud, fast
+      // failure: a misconfigured applet (no resolvable step) is now a
+      // diagnosable 400 with the full incoming request captured in the logs,
+      // instead of quietly limping along on a guessed default.
       //
-      // Defaulting to the welcome prompt is safe for both applet types: a
-      // Gather applet gets the JSON it needs, and Passthru evaluates only the
-      // HTTP status code (200 here) and ignores the body. Pure call-start
-      // logging with no body is still available via an explicit ?step=passthru.
-      const step = stepParam || "welcome";
-
-      // A request with no `step` is almost always a Passthru applet. Passthru
-      // cannot play audio or text to the caller at all — it only passes data and
-      // reads back a status code — so a flow that relies on it for prompts
-      // produces a connected but completely silent call. We still answer with a
-      // valid Gather body (harmless to Passthru, correct for Gather), but the
-      // fact is recorded so a silent call is diagnosable from the logs instead
-      // of looking like a successful prompt.
-      const appletHint = stepParam
-        ? "gather"
-        : `no-step (likely passthru; CallType=${
-          firstOf(params, "CallType") || "?"
-        })`;
-
-      const { order, orderId, source } = await resolveOrder(params);
-
-      console.log(
-        `[dynamic-greeting] step=${step}${stepParam ? "" : " (DEFAULTED)"} ` +
-          `callSid=${callSid || "-"} from=${callerNumber || "-"} ` +
-          `order=${orderId || "-"} via=${source} digits=${digits || "-"}`,
-      );
-
+      // Trade-off to be aware of: if a *Gather* applet is ever wired to this
+      // URL without a resolvable step, Exotel gets a non-Gather-shaped 400
+      // instead of a valid prompt, which Exotel treats as an invalid response
+      // and drops the call — exactly the failure this endpoint used to paper
+      // over. Only acceptable because every applet is now required to
+      // resolve a step (welcome for the entry point, passthru for pure
+      // call-start logging), so a real call should never hit this path.
       if (!stepParam) {
-        console.warn(
-          "[dynamic-greeting] request arrived WITHOUT a step parameter. If this " +
-            "is a Passthru applet it cannot speak, and the caller will hear " +
-            "silence. Point a Gather applet at ?step=welcome instead.",
+        logEvent({
+          fn: "dynamic-greeting",
+          level: "error",
+          event: "step_missing",
+          message: "No step resolved from path or query",
+          method: req.method,
+          url: req.url,
+          params: allParams,
+          status: 400,
+          callSid,
+          callerNumber,
+          durationMs: Date.now() - startedAt,
+        });
+
+        logCallStep({
+          callSid,
+          callerNumber,
+          step: "missing_step",
+          userInput: JSON.stringify(allParams),
+          status: "STEP_PARAM_MISSING",
+          appletHint: `no-step (CallType=${firstOf(params, "CallType") || "?"})`,
+        });
+
+        return Response.json(
+          {
+            error: "Missing required step",
+            hint:
+              "Point the applet at /dynamic-greeting/welcome (preferred, path-based — " +
+              "survives Exotel rewriting the query string) or ?step=welcome. " +
+              "Also valid: /passthru, /address, /done, /confirm, /issue, /goodbye.",
+            received: allParams,
+          },
+          { status: 400, headers: JSON_HEADERS },
         );
       }
+
+      const step = stepParam;
+      const appletHint = "gather";
+
+      const { order, orderId, source } = await resolveOrder(params);
+      // Order resolution failing/timing out is not fatal (the prompt
+      // degrades to generic wording), but it is anomalous enough to flag —
+      // every log below is "warning" instead of "success" whenever that
+      // happened, so it's visible without treating it as a hard error.
+      const orderDegraded = !order || source === "timeout" ||
+        source === "unresolved";
 
       // ------------------------------------------------------------------
       // Explicit Passthru — data-only notification, no audio. Exotel reads
@@ -344,6 +432,22 @@ export default {
           appletHint: "passthru (explicit)",
         });
 
+        logEvent({
+          fn: "dynamic-greeting",
+          level: orderDegraded ? "warning" : "success",
+          event: "passthru_served",
+          message: "Passthru call-start logged",
+          method: req.method,
+          url: req.url,
+          params: allParams,
+          status: 200,
+          callSid,
+          callerNumber,
+          orderId,
+          step,
+          durationMs: Date.now() - startedAt,
+        });
+
         return new Response(null, {
           status: 200,
           headers: { "Access-Control-Allow-Origin": "*" },
@@ -354,7 +458,7 @@ export default {
       // Gather applets — always 200 + JSON.
       // ------------------------------------------------------------------
       switch (step) {
-        case "welcome":
+        case "welcome": {
           logCallStep({
             callSid,
             callerNumber,
@@ -363,13 +467,11 @@ export default {
             // "SERVED" not "PLAYED": we returned a prompt, but whether the
             // caller actually heard it depends on the applet type, which only
             // Exotel knows. Claiming PLAYED made silent calls look successful.
-            status: stepParam
-              ? (order ? "WELCOME_SERVED" : "WELCOME_SERVED_NO_ORDER")
-              : "WELCOME_SERVED_NO_STEP",
+            status: order ? "WELCOME_SERVED" : "WELCOME_SERVED_NO_ORDER",
             appletHint,
           });
 
-          return gather(
+          const response = gather(
             welcomePrompt(order),
             `We did not receive a valid response.
 
@@ -378,23 +480,46 @@ export default {
              To report an issue or speak with our customer support team, please press 2.`,
           );
 
-        case "address":
+          logEvent({
+            fn: "dynamic-greeting",
+            level: orderDegraded ? "warning" : "success",
+            event: "welcome_served",
+            message: order
+              ? "Welcome prompt served for resolved order"
+              : "Welcome prompt served with NO order resolved (generic wording)",
+            method: req.method,
+            url: req.url,
+            params: allParams,
+            status: 200,
+            callSid,
+            callerNumber,
+            orderId,
+            step,
+            durationMs: Date.now() - startedAt,
+          });
+
+          return response;
+        }
+
+        case "address": {
           // The digit pressed on the welcome menu arrives with this request.
+          const addressStatus = digits === "2"
+            ? "ORDER_ISSUE_RAISED"
+            : digits === "1"
+            ? "ORDER_CONFIRMED"
+            : "ADDRESS_PROMPT_SERVED";
+
           logCallStep({
             callSid,
             callerNumber,
             orderId,
             step: "address",
             userInput: digits,
-            status: digits === "2"
-              ? "ORDER_ISSUE_RAISED"
-              : digits === "1"
-              ? "ORDER_CONFIRMED"
-              : "ADDRESS_PROMPT_SERVED",
+            status: addressStatus,
             appletHint,
           });
 
-          return gather(
+          const response = gather(
             addressPrompt(order),
             `We did not receive a valid response.
 
@@ -402,6 +527,27 @@ export default {
 
              If there is an issue with your delivery address, please press 2.`,
           );
+
+          logEvent({
+            fn: "dynamic-greeting",
+            // No digit collected on the previous menu is unusual, not just a
+            // degraded-order case — flag it too.
+            level: orderDegraded || !digits ? "warning" : "success",
+            event: "address_served",
+            message: `Address prompt served (${addressStatus})`,
+            method: req.method,
+            url: req.url,
+            params: allParams,
+            status: 200,
+            callSid,
+            callerNumber,
+            orderId,
+            step,
+            durationMs: Date.now() - startedAt,
+          });
+
+          return response;
+        }
 
         case "done":
         case "goodbye":
@@ -424,16 +570,38 @@ export default {
           // response below — notifyOrderStatusUpdate does not await the
           // network call, it schedules it via EdgeRuntime.waitUntil.
           if (orderId) {
-            notifyOrderStatusUpdate({ orderId, callSid, callerNumber, dtmf: digits });
+            notifyOrderStatusUpdate({
+              orderId,
+              callSid,
+              callerNumber,
+              dtmf: digits,
+            });
           }
 
-          return speak(closingPrompt(order, issue));
+          const response = speak(closingPrompt(order, issue));
+
+          logEvent({
+            fn: "dynamic-greeting",
+            level: orderDegraded || !orderId ? "warning" : "success",
+            event: "closing_served",
+            message: `Closing message served (issue=${issue})`,
+            method: req.method,
+            url: req.url,
+            params: allParams,
+            status: 200,
+            callSid,
+            callerNumber,
+            orderId,
+            step,
+            durationMs: Date.now() - startedAt,
+          });
+
+          return response;
         }
 
-        default:
+        default: {
           // Unknown step still answers 200 + JSON so the call ends cleanly
           // instead of being cut off by Exotel.
-          console.warn(`[dynamic-greeting] unknown step "${step}"`);
           logCallStep({
             callSid,
             callerNumber,
@@ -444,16 +612,40 @@ export default {
             appletHint,
           });
 
-          return speak(`
-Thank you for choosing mjunction.
+          const response = speak("Thank you for calling mjunction. Goodbye.");
 
-Have a great day.
+          logEvent({
+            fn: "dynamic-greeting",
+            level: "warning",
+            event: "unknown_step",
+            message: `Unrecognised step "${step}" — served generic goodbye`,
+            method: req.method,
+            url: req.url,
+            params: allParams,
+            status: 200,
+            callSid,
+            callerNumber,
+            orderId,
+            step,
+            durationMs: Date.now() - startedAt,
+          });
 
-Goodbye.
-`);
+          return response;
+        }
       }
     } catch (err) {
-      console.error("Error in dynamic-greeting:", err);
+      const message = err instanceof Error ? err.message : String(err);
+      logEvent({
+        fn: "dynamic-greeting",
+        level: "error",
+        event: "unhandled_exception",
+        message,
+        method: req.method,
+        url: req.url,
+        status: isIvrPath ? 200 : 500,
+        error: err instanceof Error ? (err.stack ?? err.message) : String(err),
+        durationMs: Date.now() - startedAt,
+      });
 
       // Exotel must still get a valid Gather body; anything else surfaces a real
       // error so genuine bugs stay visible to non-IVR callers.
