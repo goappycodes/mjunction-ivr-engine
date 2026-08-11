@@ -87,21 +87,31 @@ export async function startExotelCall(
   const flowUrl =
     `http://my.exotel.com/${accountSid}/exoml/start_voice/${appId}`;
 
-  const params = new URLSearchParams();
-  params.append("From", request.phoneNumber);
-  params.append("CallerId", callerId!);
-  params.append("Url", flowUrl);
+  // Built manually rather than via URLSearchParams: Exotel's own documented
+  // curl example sends `StatusCallbackEvents[0]=terminal` with literal,
+  // unencoded brackets, but URLSearchParams percent-encodes them to
+  // `StatusCallbackEvents%5B0%5D`, which Exotel's endpoint rejects with
+  // "Invalid 'StatusCallbackEvents' specified" — it doesn't URL-decode the
+  // key before matching it against the array-parameter name.
+  const bodyParts: string[] = [];
+  const addParam = (key: string, value: string) => {
+    bodyParts.push(`${key}=${encodeURIComponent(value)}`);
+  };
+
+  addParam("From", request.phoneNumber);
+  addParam("CallerId", callerId!);
+  addParam("Url", flowUrl);
   // The order id rides along here and Exotel echoes it back as `CustomField` on
   // every applet request, which is how dynamic-greeting knows which order to
   // build the prompt from.
-  params.append("CustomField", request.orderId);
+  addParam("CustomField", request.orderId);
   // Order-confirmation calls are transactional, which is what `trans` declares.
-  params.append("CallType", "trans");
-  params.append("Record", String(request.record ?? false));
+  addParam("CallType", "trans");
+  addParam("Record", String(request.record ?? false));
 
   if (request.statusCallbackUrl) {
-    params.append("StatusCallback", request.statusCallbackUrl);
-    params.append("StatusCallbackEvents[0]", "terminal");
+    addParam("StatusCallback", request.statusCallbackUrl);
+    bodyParts.push("StatusCallbackEvents[0]=terminal");
   }
 
   const authHeader = `Basic ${btoa(`${apiKey}:${apiToken}`)}`;
@@ -112,7 +122,7 @@ export async function startExotelCall(
       "Authorization": authHeader,
       "Content-Type": "application/x-www-form-urlencoded",
     },
-    body: params.toString(),
+    body: bodyParts.join("&"),
   });
 
   const responseText = await response.text();
