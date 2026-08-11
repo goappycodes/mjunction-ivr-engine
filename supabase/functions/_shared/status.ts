@@ -75,13 +75,14 @@ export type CallOutcome =
   | "not_reachable";
 
 /**
- * Order-confirmation outcome -> status mapping. Ported verbatim from
- * `recordOrderConfirmationCall` in mjunction's `src/lib/domain/call-flow.ts`:
- * only `confirmed` and the not-reached family advance the recipient; a
- * reported address problem or an agent transfer leaves it at
- * `order_confirm_pending` on purpose — those need a human to resolve before
- * the pipeline can move on, and the call's outcome (not the recipient status)
- * is what the escalations/unreachable queues key off.
+ * Order-confirmation outcome -> status mapping. Mirrors the function of the
+ * same name in mjunction's `src/lib/domain/status.ts` (kept in sync by hand,
+ * same as STATUS_TRANSITIONS above): only `confirmed` and the not-reached
+ * family advance the recipient; a reported address problem or an agent
+ * transfer leaves it at `order_confirm_pending` on purpose — those need a
+ * human to resolve before the pipeline can move on, and the call's outcome
+ * (not the recipient status) is what the escalations/unreachable queues key
+ * off.
  */
 export function orderConfirmationStatusFor(
   outcome: CallOutcome,

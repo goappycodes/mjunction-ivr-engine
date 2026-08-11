@@ -6,6 +6,7 @@ import {
   getRecipientStatus,
   logCallStep,
   terminalStatusOutcome,
+  updateProviderStatus,
 } from "../_shared/orders.ts";
 import { logEvent } from "../_shared/logging.ts";
 
@@ -148,9 +149,17 @@ export default {
         });
       }
 
+      // Unconditional: a "completed" status with no recording and no
+      // outcome change is still a real telephony status worth showing in
+      // mjunction's call log.
+      if (exotelStatus) {
+        await updateProviderStatus(attempt.id, exotelStatus);
+      }
+
       if (recordingUrl) {
         await attachCallRecording({
           callAttemptId: attempt.id,
+          recipientId: attempt.recipientId,
           recordingUrl,
           providerCallRef: callSid,
         });

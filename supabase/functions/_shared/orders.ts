@@ -478,8 +478,35 @@ export async function getOpenCallAttemptByCallSid(
  * can be well after the Gather flow already finalized the outcome, or can be
  * the only signal at all for a call that never answered.
  */
+/**
+ * Persist Exotel's raw telephony status (queued/ringing/completed/no-answer/
+ * busy/failed/...) onto a call_attempts row — distinct from the business
+ * `outcome` column. Written at dial time (ivr-engine/index.ts, right after
+ * startExotelCall) and again at the terminal StatusCallback
+ * (status-callback/index.ts), unconditionally — a "completed" status with no
+ * recording and no outcome change is still a real status worth showing in
+ * mjunction's call log.
+ */
+export async function updateProviderStatus(
+  callAttemptId: string,
+  status: string,
+): Promise<void> {
+  const client = db();
+  if (!client || !callAttemptId || !status) return;
+
+  const { error } = await client
+    .from("call_attempts")
+    .update({ provider_status: status })
+    .eq("id", callAttemptId);
+
+  if (error) {
+    console.error("[updateProviderStatus] update failed:", error.code, error.message);
+  }
+}
+
 export async function attachCallRecording(params: {
   callAttemptId: string;
+  recipientId: string;
   recordingUrl: string;
   providerCallRef: string;
 }): Promise<void> {
@@ -496,7 +523,10 @@ export async function attachCallRecording(params: {
 
   if (error) {
     console.error("[attachCallRecording] update failed:", error.code, error.message);
+    return;
   }
+
+  notifyPortalCallRecordsRefresh(params.recipientId);
 }
 
 /**
@@ -648,6 +678,44 @@ export async function finalizeCallAttempt(
       });
     }
   }
+
+  notifyPortalCallRecordsRefresh(params.recipientId);
+}
+
+/**
+ * Fire-and-forget notification to mjunction's telephony webhook so it can
+ * refresh the derived `call_records` rollup (VOC/Reports) for this
+ * recipient — mirrors `notifyOrderStatusUpdate`'s pattern, but crosses into
+ * the sibling mjunction repo instead of staying within this project's own
+ * functions. A missing `PORTAL_WEBHOOK_URL`/`IVR_SHARED_SECRET` degrades to
+ * a no-op (call_records simply stays stale) rather than failing the call.
+ */
+export function notifyPortalCallRecordsRefresh(recipientId: string): void {
+  const portalWebhookUrl = Deno.env.get("PORTAL_WEBHOOK_URL");
+  const secret = Deno.env.get("IVR_SHARED_SECRET");
+  if (!portalWebhookUrl || !secret) return;
+
+  const task = fetch(portalWebhookUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-ivr-shared-secret": secret,
+    },
+    body: JSON.stringify({ recipientId }),
+  })
+    .then(async (res) => {
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        console.error(
+          `[notifyPortalCallRecordsRefresh] portal webhook returned ${res.status}: ${text}`,
+        );
+      }
+    })
+    .catch((err) => {
+      console.error("[notifyPortalCallRecordsRefresh] request failed:", err);
+    });
+
+  waitUntil(task);
 }
 
 // ---------------------------------------------------------------------------

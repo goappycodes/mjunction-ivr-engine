@@ -5,6 +5,7 @@ import {
   lookupOrderById,
   startCallAttempt,
   transitionRecipientStatus,
+  updateProviderStatus,
   upsertCallLog,
 } from "../_shared/orders.ts";
 import { type LogLevel, logEvent } from "../_shared/logging.ts";
@@ -68,6 +69,18 @@ export default {
       if (req.method !== "POST") {
         log("warning", "method_not_allowed", `${req.method} not allowed`, 405);
         return json({ success: false, error: "Method not allowed" }, 405);
+      }
+
+      // This endpoint places a real, billed outbound call — verify_jwt is
+      // off for all functions in this project (see supabase/config.toml), so
+      // without this check anyone who can reach the Functions URL could
+      // trigger a call. A shared secret, not a JWT, because the caller is
+      // mjunction's server (no end-user session to verify).
+      const expectedSecret = Deno.env.get("IVR_SHARED_SECRET");
+      const providedSecret = req.headers.get("x-ivr-shared-secret");
+      if (!expectedSecret || providedSecret !== expectedSecret) {
+        log("warning", "unauthorized", "Missing or invalid x-ivr-shared-secret", 401);
+        return json({ success: false, error: "Unauthorized" }, 401);
       }
 
       let body: StartCallBody;
@@ -177,6 +190,12 @@ export default {
       };
 
       const result = await startExotelCall(callRequest);
+
+      // Show a real telephony status (e.g. "queued") in mjunction's call log
+      // immediately, before any outcome exists.
+      if (attempt?.id) {
+        await updateProviderStatus(attempt.id, result.status);
+      }
 
       // Record the CallSid to order + call_attempt mapping now, so later
       // steps can recover both from the CallSid alone. Awaited: the reply is
