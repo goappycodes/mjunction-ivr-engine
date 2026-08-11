@@ -87,12 +87,6 @@ export async function startExotelCall(
   const flowUrl =
     `http://my.exotel.com/${accountSid}/exoml/start_voice/${appId}`;
 
-  // Built manually rather than via URLSearchParams: Exotel's own documented
-  // curl example sends `StatusCallbackEvents[0]=terminal` with literal,
-  // unencoded brackets, but URLSearchParams percent-encodes them to
-  // `StatusCallbackEvents%5B0%5D`, which Exotel's endpoint rejects with
-  // "Invalid 'StatusCallbackEvents' specified" — it doesn't URL-decode the
-  // key before matching it against the array-parameter name.
   const bodyParts: string[] = [];
   const addParam = (key: string, value: string) => {
     bodyParts.push(`${key}=${encodeURIComponent(value)}`);
@@ -109,9 +103,15 @@ export async function startExotelCall(
   addParam("CallType", "trans");
   addParam("Record", String(request.record ?? false));
 
+  // `StatusCallbackEvents` is omitted: this account's Calls/connect (v1)
+  // rejects it outright with "Invalid 'StatusCallbackEvents' specified"
+  // regardless of format (tried both URL-encoded and literal
+  // `StatusCallbackEvents[0]=terminal` bracket syntax, both rejected) — it's
+  // likely a v3-only parameter per Exotel's docs, not supported here.
+  // `StatusCallback` alone still gets a terminal-status POST from Exotel by
+  // default, so status-callback/index.ts keeps working without it.
   if (request.statusCallbackUrl) {
     addParam("StatusCallback", request.statusCallbackUrl);
-    bodyParts.push("StatusCallbackEvents[0]=terminal");
   }
 
   const authHeader = `Basic ${btoa(`${apiKey}:${apiToken}`)}`;
