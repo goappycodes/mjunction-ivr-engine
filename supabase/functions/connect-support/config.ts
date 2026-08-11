@@ -37,9 +37,11 @@ export interface ConnectConfig {
   /** When true, Exotel re-fetches this URL after a failed attempt (for rotation). */
   fetchAfterAttempt: boolean;
   /**
-   * Order status to persist when the caller is transferred to support. Written
-   * via update-order-status (never a direct DB write from here). Empty disables
-   * the status update.
+   * Call outcome to record when the caller is transferred to support — one of
+   * the `call_attempts.outcome` values (default `transferred_to_agent`, which
+   * is what the escalations queue's order-type filter looks for). Written via
+   * update-order-status (never a direct DB write from here). Empty disables
+   * the update.
    */
   orderStatus: string;
 }
@@ -80,7 +82,10 @@ const DEFAULTS = {
   // "both"/"callee"), which drops the call. Opt in via SUPPORT_WAIT_MESSAGE once
   // the basic transfer is confirmed working.
   waitMessage: "",
-  orderStatus: "issue_raised",
+  // Matches the outcome the order-confirmation script itself would record for
+  // a "press 2" escalation (see resolveOrderConfirmationOutcome), and the
+  // value the escalations queue's order-type filter queries for.
+  orderStatus: "transferred_to_agent",
 };
 
 /**
