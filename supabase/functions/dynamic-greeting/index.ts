@@ -600,50 +600,13 @@ export default {
           return response;
         }
 
-        // Reached via the address Gather's "incorrect" branch — an
-        // address-level problem, distinct from an order-level "issue"
-        // below. Not yet wired in the Exotel flow as of this change; see
-        // the accompanying README update for what to add.
-        case "address-issue": {
-          logCallStep({
-            callSid,
-            callerNumber,
-            orderId,
-            step: "done",
-            userInput: digits,
-            status: "ADDRESS_ISSUE_RAISED",
-            appletHint,
-          });
-
-          if (orderId) {
-            notifyOrderStatusUpdate({
-              orderId,
-              callSid,
-              callerNumber,
-              outcome: "corrected",
-            });
-          }
-
-          const response = speak(closingPrompt(order, true));
-
-          logEvent({
-            fn: "dynamic-greeting",
-            level: orderDegraded || !orderId ? "warning" : "success",
-            event: "closing_served",
-            message: "Closing message served (address issue)",
-            method: req.method,
-            url: req.url,
-            params: allParams,
-            status: 200,
-            callSid,
-            callerNumber,
-            orderId,
-            step,
-            durationMs: Date.now() - startedAt,
-          });
-
-          return response;
-        }
+        // NOTE: the address Gather's "incorrect" branch does NOT come back
+        // here. It goes straight to a Greeting + Connect applet, wired to
+        // the `connect-telecaller` function, which resolves the assigned
+        // telecaller's phone and live-transfers the call — see that
+        // function and the README's flow diagram. This endpoint only ever
+        // serves prompts (Gather/Passthru), never a live transfer, so it
+        // has no "address-issue" step of its own.
 
         // Reached via the welcome Gather's "issue" branch — an order-level
         // issue; the caller wants to speak to an agent.

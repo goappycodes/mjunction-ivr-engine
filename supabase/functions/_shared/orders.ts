@@ -63,6 +63,8 @@ export interface OrderRecord {
   /** Internal — `recipients.id`, needed for every write below. */
   recipient_id: string;
   campaign_id: string;
+  /** E.164 — the telecaller to live-transfer to on an address issue (connect-telecaller). */
+  telecaller_phone: string | null;
 }
 
 const RECIPIENT_COLUMNS = [
@@ -74,6 +76,7 @@ const RECIPIENT_COLUMNS = [
   "status",
   "recipient_id:id",
   "campaign_id",
+  "telecaller_phone",
 ].join(", ");
 
 /**
