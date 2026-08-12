@@ -502,20 +502,20 @@ export default {
         }
 
         case "address": {
-          // The digit pressed on the welcome menu arrives with this request.
-          const addressStatus = digits === "2"
-            ? "ORDER_ISSUE_RAISED"
-            : digits === "1"
-            ? "ORDER_CONFIRMED"
-            : "ADDRESS_PROMPT_SERVED";
-
+          // Reached only via the welcome Gather's "confirm" branch (Exotel's
+          // own Switch Case routes on the collected digit and only calls
+          // this URL for a "1" press) — the order-confirmation digit is
+          // implied by having reached this step at all, not something to
+          // read back from the request. Exotel does not echo a prior digit
+          // into this flow's requests (confirmed by inspecting the raw
+          // payload — no digit param of any kind is present).
           logCallStep({
             callSid,
             callerNumber,
             orderId,
             step: "address",
             userInput: digits,
-            status: addressStatus,
+            status: "ADDRESS_PROMPT_SERVED",
             appletHint,
           });
 
@@ -530,11 +530,9 @@ export default {
 
           logEvent({
             fn: "dynamic-greeting",
-            // No digit collected on the previous menu is unusual, not just a
-            // degraded-order case — flag it too.
-            level: orderDegraded || !digits ? "warning" : "success",
+            level: orderDegraded ? "warning" : "success",
             event: "address_served",
-            message: `Address prompt served (${addressStatus})`,
+            message: "Address prompt served",
             method: req.method,
             url: req.url,
             params: allParams,
@@ -549,19 +547,22 @@ export default {
           return response;
         }
 
+        // Each of these is reached via a distinct Switch Case branch in the
+        // configured Exotel flow, so the outcome is implied entirely by
+        // which URL was called — sent explicitly to update-order-status
+        // rather than derived from a DTMF digit that this flow never
+        // forwards (see the "address" case comment above).
         case "done":
         case "goodbye":
-        case "confirm":
-        case "issue": {
-          const issue = digits === "2" || step === "issue";
-
+        case "confirm": {
+          // Reached only via the address Gather's "correct" branch.
           logCallStep({
             callSid,
             callerNumber,
             orderId,
             step: "done",
             userInput: digits,
-            status: issue ? "ADDRESS_ISSUE_RAISED" : "ADDRESS_CONFIRMED",
+            status: "ADDRESS_CONFIRMED",
             appletHint,
           });
 
@@ -574,17 +575,105 @@ export default {
               orderId,
               callSid,
               callerNumber,
-              dtmf: digits,
+              outcome: "confirmed",
             });
           }
 
-          const response = speak(closingPrompt(order, issue));
+          const response = speak(closingPrompt(order, false));
 
           logEvent({
             fn: "dynamic-greeting",
             level: orderDegraded || !orderId ? "warning" : "success",
             event: "closing_served",
-            message: `Closing message served (issue=${issue})`,
+            message: "Closing message served (address confirmed)",
+            method: req.method,
+            url: req.url,
+            params: allParams,
+            status: 200,
+            callSid,
+            callerNumber,
+            orderId,
+            step,
+            durationMs: Date.now() - startedAt,
+          });
+
+          return response;
+        }
+
+        // Reached via the address Gather's "incorrect" branch — an
+        // address-level problem, distinct from an order-level "issue"
+        // below. Not yet wired in the Exotel flow as of this change; see
+        // the accompanying README update for what to add.
+        case "address-issue": {
+          logCallStep({
+            callSid,
+            callerNumber,
+            orderId,
+            step: "done",
+            userInput: digits,
+            status: "ADDRESS_ISSUE_RAISED",
+            appletHint,
+          });
+
+          if (orderId) {
+            notifyOrderStatusUpdate({
+              orderId,
+              callSid,
+              callerNumber,
+              outcome: "corrected",
+            });
+          }
+
+          const response = speak(closingPrompt(order, true));
+
+          logEvent({
+            fn: "dynamic-greeting",
+            level: orderDegraded || !orderId ? "warning" : "success",
+            event: "closing_served",
+            message: "Closing message served (address issue)",
+            method: req.method,
+            url: req.url,
+            params: allParams,
+            status: 200,
+            callSid,
+            callerNumber,
+            orderId,
+            step,
+            durationMs: Date.now() - startedAt,
+          });
+
+          return response;
+        }
+
+        // Reached via the welcome Gather's "issue" branch — an order-level
+        // issue; the caller wants to speak to an agent.
+        case "issue": {
+          logCallStep({
+            callSid,
+            callerNumber,
+            orderId,
+            step: "done",
+            userInput: digits,
+            status: "ORDER_ISSUE_RAISED",
+            appletHint,
+          });
+
+          if (orderId) {
+            notifyOrderStatusUpdate({
+              orderId,
+              callSid,
+              callerNumber,
+              outcome: "transferred_to_agent",
+            });
+          }
+
+          const response = speak(closingPrompt(order, true));
+
+          logEvent({
+            fn: "dynamic-greeting",
+            level: orderDegraded || !orderId ? "warning" : "success",
+            event: "closing_served",
+            message: "Closing message served (order issue)",
             method: req.method,
             url: req.url,
             params: allParams,

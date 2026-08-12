@@ -193,25 +193,37 @@ runs it with `--rm`). Use `supabase stop && supabase start` instead.
 
 ## Exotel applet configuration
 
-Point the Exotel flow at these URLs (both must return HTTP 200; the Gather URLs
-must return `application/json` or Exotel drops the call):
+The flow is built with **Exotel's own Switch Case node** doing the DTMF
+branching — not a digit echoed between applet requests. Each Gather node's
+own dynamic URL only ever needs to serve *that* node's prompt; the fact that
+Exotel called a given URL at all already tells this function which branch
+the caller took, because each URL is reachable from exactly one Switch Case
+outcome. (An earlier version of this doc assumed Exotel echoes the previous
+menu's digit into the next request — confirmed false by inspecting the raw
+payload live: no `digits`/`Digits`/`dtmf` field is present at all on the
+`address`/`done` steps. `dynamic-greeting/index.ts` derives the outcome
+purely from which step URL was called, per the case comments there.)
 
-| Applet | URL | Routing |
-| --- | --- | --- |
-| Passthru (call start) | `<FUNCTIONS_URL>/dynamic-greeting` | → welcome |
-| Gather — order confirm | `<FUNCTIONS_URL>/dynamic-greeting?step=welcome` | 1 → address, 2 → issue |
-| Gather — address confirm | `<FUNCTIONS_URL>/dynamic-greeting?step=address` | 1 → done, 2 → issue |
-| Gather — closing | `<FUNCTIONS_URL>/dynamic-greeting?step=done` | → hangup |
-| Gather — issue closing | `<FUNCTIONS_URL>/dynamic-greeting?step=issue` | → hangup |
+Path-based routing (`/dynamic-greeting/welcome`, not `?step=welcome`) is
+preferred — it survives Exotel rewriting the query string; `?step=` still
+works as a fallback.
 
-Exotel appends its own parameters to whatever URL you configure, so
-`?step=welcome` arrives as
-`?step=welcome&CallSid=...&CallFrom=...&CustomField=...&digits="1"`.
-The digit pressed on one menu arrives with the request for the *next* applet —
-which is why `step=address` records the answer to the order question, and
-`step=done` records the answer to the address question.
+| Applet | Type | URL | Switch Case routing |
+| --- | --- | --- | --- |
+| Call start | Gather | `<FUNCTIONS_URL>/dynamic-greeting/welcome` | 1 → address, 2 → issue |
+| Address confirm | Gather | `<FUNCTIONS_URL>/dynamic-greeting/address` | 1 → done, 2 → **address-issue** |
+| Closing (confirmed) | Gather | `<FUNCTIONS_URL>/dynamic-greeting/done` | → Greeting → Hangup |
+| Closing (address issue) | Gather | `<FUNCTIONS_URL>/dynamic-greeting/address-issue` | → Greeting → Hangup |
+| Closing (order issue) | Gather | `<FUNCTIONS_URL>/dynamic-greeting/issue` | → Hangup |
 
-Any unrecognised `step` now returns a valid closing message rather than a 404.
+**`address-issue` is not wired yet as of this note** — today, pressing 2 on
+the address-confirmation menu goes straight to a Greeting + Hangup with no
+application URL in between, so this backend never learns that the address
+needs correction. Add a Gather (or minimal Passthru-style) applet call to
+`.../dynamic-greeting/address-issue` in that branch, before the Greeting,
+the same way `address`'s Case 1 already calls `.../dynamic-greeting/done`.
+
+Any unrecognised `step` still returns a valid closing message rather than a 404.
 
 `status-callback` is **not** wired into the Exotel flow builder like the
 applets above — it is not an applet at all. `ivr-engine` passes it as the
