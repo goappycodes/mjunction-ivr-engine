@@ -174,6 +174,12 @@ rest are optional and fall back to the defaults in `connect-support/config.ts`:
   default `transferred_to_agent`, which is what the escalations queue's
   order-type filter looks for; set empty to disable the update).
 
+`connect-telecaller` needs no required secret of its own — it resolves the
+destination from each order's `telecaller_phone` at call time, falling back to
+`SUPPORT_NUMBER`/`SUPPORT_NUMBERS` above when a recipient has none on file.
+Its own knobs (`TELECALLER_*`) are all optional; see "Transferring to the
+assigned telecaller" below.
+
 `supabase start` has no `--env-file` flag — `env(...)` in `config.toml` is
 resolved from the **process environment**, so the file must be exported into the
 shell first. Verified procedure:
@@ -193,25 +199,39 @@ runs it with `--rm`). Use `supabase stop && supabase start` instead.
 
 ## Exotel applet configuration
 
-Point the Exotel flow at these URLs (both must return HTTP 200; the Gather URLs
-must return `application/json` or Exotel drops the call):
+The flow is built with **Exotel's own Switch Case node** doing the DTMF
+branching — not a digit echoed between applet requests. Each Gather node's
+own dynamic URL only ever needs to serve *that* node's prompt; the fact that
+Exotel called a given URL at all already tells this function which branch
+the caller took, because each URL is reachable from exactly one Switch Case
+outcome. (An earlier version of this doc assumed Exotel echoes the previous
+menu's digit into the next request — confirmed false by inspecting the raw
+payload live: no `digits`/`Digits`/`dtmf` field is present at all on the
+`address`/`done` steps. `dynamic-greeting/index.ts` derives the outcome
+purely from which step URL was called, per the case comments there.)
 
-| Applet | URL | Routing |
-| --- | --- | --- |
-| Passthru (call start) | `<FUNCTIONS_URL>/dynamic-greeting` | → welcome |
-| Gather — order confirm | `<FUNCTIONS_URL>/dynamic-greeting?step=welcome` | 1 → address, 2 → issue |
-| Gather — address confirm | `<FUNCTIONS_URL>/dynamic-greeting?step=address` | 1 → done, 2 → issue |
-| Gather — closing | `<FUNCTIONS_URL>/dynamic-greeting?step=done` | → hangup |
-| Gather — issue closing | `<FUNCTIONS_URL>/dynamic-greeting?step=issue` | → hangup |
+Path-based routing (`/dynamic-greeting/welcome`, not `?step=welcome`) is
+preferred — it survives Exotel rewriting the query string; `?step=` still
+works as a fallback.
 
-Exotel appends its own parameters to whatever URL you configure, so
-`?step=welcome` arrives as
-`?step=welcome&CallSid=...&CallFrom=...&CustomField=...&digits="1"`.
-The digit pressed on one menu arrives with the request for the *next* applet —
-which is why `step=address` records the answer to the order question, and
-`step=done` records the answer to the address question.
+| Applet | Type | URL | Switch Case routing |
+| --- | --- | --- | --- |
+| Call start | Gather | `<FUNCTIONS_URL>/dynamic-greeting/welcome` | 1 → address, 2 → issue |
+| Address confirm | Gather | `<FUNCTIONS_URL>/dynamic-greeting/address` | 1 → done, 2 → **Greeting → Connect** |
+| Closing (confirmed) | Gather | `<FUNCTIONS_URL>/dynamic-greeting/done` | → Greeting → Hangup |
+| Closing (order issue) | Gather | `<FUNCTIONS_URL>/dynamic-greeting/issue` | → Hangup |
 
-Any unrecognised `step` now returns a valid closing message rather than a 404.
+The address-confirmation menu's "incorrect" branch (Case 2) does **not** call
+back into `dynamic-greeting` at all — there is no `address-issue` step. It
+goes straight to a Greeting (any static/dynamic Exotel greeting — e.g. "Please
+hold while we connect you to your telecaller") and then a **Connect** applet
+wired to `connect-telecaller` (see below), which resolves the order's
+assigned telecaller and live-transfers the call. That Connect applet's own
+Dynamic URL fetch is what records the `transferred_to_agent` outcome — no
+separate logging step is needed before it.
+
+Any unrecognised `step` on `dynamic-greeting` still returns a valid closing
+message rather than a 404.
 
 `status-callback` is **not** wired into the Exotel flow builder like the
 applets above — it is not an applet at all. `ivr-engine` passes it as the
@@ -273,7 +293,51 @@ When it serves a number, `connect-support` also records this call's outcome —
 never writes to `recipients` / `call_attempts` directly; that write stays owned
 by one function. The update is skipped for inbound calls that carry no order id.
 
-All four are **Gather** applets. The closing messages are Gather applets too,
+`connect-support` is not currently wired into either Switch Case branch of the
+live flow (the welcome menu's "issue" branch just Gathers and hangs up) — it's
+available if a future flow wants a live transfer to a generic support line.
+
+### Transferring to the assigned telecaller (address-issue Connect applet)
+
+The address-confirmation menu's "incorrect" branch (Case 2) needs its own
+Connect applet, added **after** its Greeting node, with its Dynamic URL
+pointed at `connect-telecaller`:
+
+| Applet | URL | Purpose |
+| --- | --- | --- |
+| Connect (Dynamic URL) | `<FUNCTIONS_URL>/connect-telecaller` | Dials the order's assigned telecaller and bridges the caller |
+
+`connect-telecaller` reads the same `CustomField` (order id) Exotel already
+carries, looks up that recipient's `telecaller_phone` (imported per-row in
+mjunction alongside `telecaller_name` — the "Tele Caller Contact No" import
+column), and returns the same Exotel Connect JSON shape as `connect-support`
+(shared in `_shared/connect.ts`, so both endpoints stay wire-compatible by
+construction). If the order has no `telecaller_phone` on file, it falls back
+to the account-wide `SUPPORT_NUMBER`/`SUPPORT_NUMBERS` — same env vars
+`connect-support` uses — so a data gap degrades to "reaches someone" instead
+of dropping the call. If neither resolves, the endpoint returns HTTP 500 so
+Exotel runs its configured fallback URL instead of bridging to dead air.
+
+Optional tuning env vars (all fall back to sane defaults in
+`connect-telecaller/config.ts` — only set what you need to change):
+`TELECALLER_COUNTRY_CODE` (default `91`), `TELECALLER_OUTGOING_PHONE_NUMBER`
+(must be E.164), `TELECALLER_RECORD` (default `false`),
+`TELECALLER_RECORDING_CHANNELS` (`single`|`dual`, default `single`),
+`TELECALLER_MAX_RINGING_DURATION` (default `30`, max `60`),
+`TELECALLER_MAX_CONVERSATION_DURATION` (default `900`, max `4500`),
+`TELECALLER_MUSIC_ON_HOLD_TYPE` (default `default_tone`),
+`TELECALLER_WAIT_MESSAGE`, `TELECALLER_FETCH_AFTER_ATTEMPT` (default `false`).
+
+On success it records the call's outcome as `transferred_to_agent` (the same
+outcome the escalations queue's order-type filter already looks for), via
+`update-order-status`, fire-and-forget. Once the telecaller has spoken to the
+caller and knows the correct address, they resolve it from the recipient's
+page in mjunction (the existing "Resolve escalation" action — enter the
+corrected address, or confirm it was unchanged), the same way a `SUPPORT_NUMBER`
+transfer would be resolved today.
+
+All Gather applets above conform to the same response contract; the closing
+messages are Gather applets too,
 not Greeting applets — a Greeting applet's dynamic URL expects a different body
 (`{"greeting_url": "..."}` or `text/plain`) and would reject the Gather payload
 this function returns.

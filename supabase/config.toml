@@ -477,3 +477,12 @@ enabled = true
 verify_jwt = false
 import_map = "./functions/status-callback/deno.json"
 entrypoint = "./functions/status-callback/index.ts"
+
+[functions.connect-telecaller]
+enabled = true
+# Fetched by Exotel's Connect applet (Dynamic URL) mid-call, on the
+# address-issue branch, to obtain the assigned telecaller's phone number.
+# Exotel carries no JWT, same as the other applet endpoints.
+verify_jwt = false
+import_map = "./functions/connect-telecaller/deno.json"
+entrypoint = "./functions/connect-telecaller/index.ts"
