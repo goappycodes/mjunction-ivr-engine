@@ -7,6 +7,15 @@
  * functions, so this is a deliberate, small, hand-kept-in-sync copy rather than
  * an import — if the admin panel's status graph changes, mirror the change
  * here too.
+ *
+ * ISSUE_RAISED — every press-2 lands here.
+ * The IVR used to live-transfer a press-2 caller to their telecaller, which
+ * left the recipient at `order_confirm_pending` with the escalation recorded
+ * only as a `call_attempts.outcome`. That transfer is retired: pressing 2 on
+ * any menu, in either half of the pipeline, now moves the recipient to
+ * `issue_raised` and the escalations queue reads that status directly. No new
+ * enum value was added — `issue_raised` already meant exactly this, it just
+ * used to be reachable only from the delivery half.
  */
 
 export type RecipientStatus =
@@ -29,6 +38,7 @@ export const STATUS_TRANSITIONS: Record<RecipientStatus, RecipientStatus[]> = {
     "address_confirmed",
     "address_corrected",
     "order_unreachable",
+    "issue_raised", // press 2 on either menu — see the ISSUE_RAISED note above
     "order_confirm_pending", // retry
   ],
   address_confirmed: ["dispatched"],
@@ -37,6 +47,7 @@ export const STATUS_TRANSITIONS: Record<RecipientStatus, RecipientStatus[]> = {
     "order_confirm_pending",
     "address_confirmed",
     "address_corrected",
+    "issue_raised",
   ],
   dispatched: ["delivered"],
   delivered: ["delivery_confirm_pending"],
@@ -47,7 +58,16 @@ export const STATUS_TRANSITIONS: Record<RecipientStatus, RecipientStatus[]> = {
     "delivery_confirm_pending", // retry
   ],
   confirmed: ["closed"],
-  issue_raised: ["closed", "delivery_confirm_pending"],
+  // Raised from BOTH halves of the pipeline now, so it has to be resolvable
+  // back into either — an order-phase escalation ends with the agent capturing
+  // the address, a delivery-phase one ends closed or re-queued.
+  issue_raised: [
+    "closed",
+    "delivery_confirm_pending",
+    "address_confirmed",
+    "address_corrected",
+    "order_confirm_pending",
+  ],
   delivery_unreachable: [
     "delivery_confirm_pending",
     "confirmed",
@@ -96,7 +116,11 @@ export function orderConfirmationStatusFor(
   ) {
     return "order_unreachable";
   }
-  // corrected | issue_raised | transferred_to_agent -> stays put.
+  if (outcome === "issue_raised" || outcome === "transferred_to_agent") {
+    return "issue_raised";
+  }
+  // `corrected` stays put: it is written by the agent resolving an escalation,
+  // which applies its own transition, not by the IVR.
   return from;
 }
 
@@ -106,20 +130,19 @@ export function orderConfirmationStatusFor(
  * the function of the same name in mjunction's `src/lib/domain/status.ts`
  * (kept in sync by hand, same as everything else in this module).
  *
- * Same philosophy as the order side: a clean confirm and a never-reached call
- * advance the recipient; anything that needs a human first — a raised issue
- * or a live transfer to the telecaller — leaves the recipient where it is so
- * the escalations queue (which keys off `call_attempts.outcome`, not the
- * recipient status) owns it. The one deliberate difference is `issue_raised`,
- * which IS a recipient status here, because a delivery issue is a terminal
- * state of the pipeline rather than something to retry.
+ * Same philosophy as the order side: a clean confirm advances the recipient, a
+ * never-reached call marks it unreachable, and a press-2 raises an issue.
+ * `transferred_to_agent` maps here too, only because historical rows carry it
+ * — the live transfer itself is retired (see the ISSUE_RAISED note above).
  */
 export function deliveryConfirmationStatusFor(
   outcome: CallOutcome,
   from: RecipientStatus,
 ): RecipientStatus {
   if (outcome === "confirmed") return "confirmed";
-  if (outcome === "issue_raised") return "issue_raised";
+  if (outcome === "issue_raised" || outcome === "transferred_to_agent") {
+    return "issue_raised";
+  }
   if (
     outcome === "no_answer" ||
     outcome === "wrong_number" ||
@@ -127,6 +150,6 @@ export function deliveryConfirmationStatusFor(
   ) {
     return "delivery_unreachable";
   }
-  // corrected | transferred_to_agent -> stays put, pending a human.
+  // `corrected` stays put — agent-written, same as on the order side.
   return from;
 }

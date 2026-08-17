@@ -64,7 +64,7 @@ export interface OrderRecord {
   /** Internal — `recipients.id`, needed for every write below. */
   recipient_id: string;
   campaign_id: string;
-  /** E.164 — the telecaller to live-transfer to on an address issue (connect-telecaller). */
+  /** E.164 — the telecaller who owns this order; shown in mjunction, not dialled by the IVR. */
   telecaller_phone: string | null;
 }
 
@@ -349,8 +349,10 @@ export function resolveOrderConfirmationOutcome(
   welcomeDigit: string,
   addressDigit: string,
 ): CallOutcome {
-  if (addressDigit === "2") return "corrected";
-  if (welcomeDigit === "2") return "transferred_to_agent";
+  // Both menus' "press 2" now mean the same thing — this order needs a human
+  // — since the live transfer that used to distinguish them is retired. See
+  // the ISSUE_RAISED note in _shared/status.ts.
+  if (addressDigit === "2" || welcomeDigit === "2") return "issue_raised";
   return "confirmed";
 }
 
@@ -362,11 +364,7 @@ export function resolveOrderConfirmationOutcome(
  * `_shared/flow.ts` — but the meanings do not, which is why this is a separate
  * function rather than a shared one with a flag:
  *
- *   - second menu "2" (item wrong/damaged) -> `issue_raised`, the terminal
- *     "something went wrong with this delivery" outcome. Note the caller is
- *     *also* live-transferred to their telecaller on this branch, and that
- *     Connect applet records `transferred_to_agent` first; whichever lands
- *     first wins, since finalizing is idempotent (see update-order-status).
+ *   - second menu "2" (item wrong/damaged) -> `issue_raised`.
  *   - welcome "2" (never received it) -> `issue_raised` too. A non-delivery is
  *     an issue with this delivery, not an unreachable call.
  *   - otherwise -> a clean `confirmed`, which is what seals the VOC.
@@ -854,10 +852,9 @@ export function notifyPortalCallRecordsRefresh(recipientId: string): void {
 
 // ---------------------------------------------------------------------------
 // Cross-function notification — written by `update-order-status`, triggered
-// by `dynamic-greeting` (Gather flow finished) and `connect-support` (agent
-// transfer).
+// by `dynamic-greeting` when the Gather flow finishes.
 //
-// dynamic-greeting/connect-support know which call_sid this is and (at most)
+// dynamic-greeting knows which call_sid this is and (at most)
 // the single digit their own step just collected, but are not allowed to
 // write to `recipients` / `call_attempts` themselves, and must not add a
 // blocking DB read to their own response — every millisecond there counts
@@ -884,7 +881,7 @@ export interface OrderStatusNotification {
 }
 
 /**
- * Fire-and-forget call from `dynamic-greeting`/`connect-support` to the
+ * Fire-and-forget call from `dynamic-greeting` to the
  * `update-order-status` function. Uses `EdgeRuntime.waitUntil` so the HTTP
  * call can finish after the Exotel response has already gone out, without
  * delaying it and without the isolate being torn down early.

@@ -22,11 +22,6 @@ mock call — see "How the order id flows through the call" below.
 `supabase/functions/dynamic-greeting/` — serves the live call flow to Exotel
 - `index.ts` - Passthru (call-start) + dynamic Gather endpoints
 
-`supabase/functions/connect-support/` — transfers the caller to a live agent
-- `index.ts` - Exotel Connect applet (Dynamic URL) endpoint
-- `config.ts` - resolves the support number + connect settings (env now, DB later)
-- `exotel.ts` - maps that config onto Exotel's Connect response schema
-
 `supabase/functions/update-order-status/` — sole owner of the `recipients` /
 `call_attempts` write
 - `index.ts` - finalizes a call's outcome (from a DTMF digit or an explicit
@@ -52,21 +47,59 @@ confirmation** — and they share **one Exotel app, one App ID and one flow**.
 Nothing in the Exotel flow builder changes to add the second one.
 
 That works because the two scripts have the same shape (a welcome menu, a
-second-level confirm menu on "press 1", a closing message per terminal branch,
-a live transfer on the second-level "press 2") and because every word a caller
-hears is served by this project's own dynamic URLs. Exotel only ever decides
-*which URL to call*; this project decides *what that URL says*:
+second-level confirm menu on "press 1", one closing per terminal branch) and
+because every word a caller hears is served by this project's own dynamic URLs.
+Exotel only ever decides *which URL to call*; this project decides *what that
+URL says*.
 
-| Exotel node (unchanged) | `order_confirmation` | `delivery_confirmation` |
+### The flow
+
+Three Gather nodes and two Switch Cases. `1` always means "all good" and `2`
+always means "something is wrong", in both scripts.
+
+```
+                        ┌───────────────────────┐
+                        │  Gather  /welcome     │
+                        │  press 1  |  press 2  │
+                        └────┬─────────────┬────┘
+                          1  │             │  2
+                             ▼             │
+                   ┌───────────────────┐   │
+                   │  Gather  /address │   │
+                   │  press 1 | press 2│   │
+                   └────┬───────────┬──┘   │
+                     1  │           │  2   │
+                        ▼           └──────┤
+              ┌──────────────────┐         ▼
+              │  Gather  /done   │   ┌──────────────────┐
+              │  "confirmed"     │   │  Gather  /issue  │
+              └────────┬─────────┘   │  "we'll call you"│
+                       │             └────────┬─────────┘
+                       ▼                      ▼
+                    Hangup                 Hangup
+              outcome: confirmed      outcome: issue_raised
+```
+
+What each node says, per script:
+
+| Node | `order_confirmation` | `delivery_confirmation` |
 | --- | --- | --- |
-| Gather `/welcome` | confirm the order | did you receive the delivery |
-| Gather `/address` (case 1) | confirm the address | confirm the item delivered |
-| Gather `/done` (case 1→1) | address confirmed | delivery confirmed |
-| Gather `/issue` (case 2) | order issue → agent | never received → issue raised |
-| Connect (case 1→2) | → assigned telecaller | → assigned telecaller |
+| `/welcome` | confirm the order | did you receive the delivery |
+| `/address` | confirm the address | confirm the item delivered |
+| `/done` | address confirmed | delivery confirmed |
+| `/issue` | — the same escalation message for every press-2 — | |
 
-In both scripts `1` means "all good" and `2` means "something is wrong", so the
-existing Switch Case wiring stays valid either way.
+**Both press-2 branches converge on `/issue`.** The caller hears one message —
+*"For your assistance, we're connecting you with our team now. One of our team
+members will call you shortly."* — and the call ends. No transfer is placed;
+the recipient moves to `issue_raised` and an agent picks them up from
+mjunction's escalations queue. At that point the only thing true of all four
+press-2 cases is that a person will follow up, which is why the wording is
+deliberately generic.
+
+Outcomes written: `/done` → `confirmed`, `/issue` → `issue_raised`, and a call
+that never reaches a menu → `no_answer` / `not_reachable` from Exotel's
+terminal status (see "Call recording & terminal status").
 
 Which script to read travels with the call in `CustomField`, the one per-call
 value Exotel echoes to every applet request. `ivr-engine` encodes it as
@@ -87,11 +120,9 @@ Same tables as an order-confirmation call, with two differences:
 
 - **Status transitions** follow `deliveryConfirmationStatusFor`
   (`_shared/status.ts`): `confirmed` → `confirmed`, `issue_raised` →
-  `issue_raised`, no-answer/busy/failed → `delivery_unreachable`. A live
-  transfer (`transferred_to_agent`) deliberately leaves the recipient at
-  `delivery_confirm_pending` until the telecaller resolves it — same posture
-  the order side takes, and the escalations queue keys off
-  `call_attempts.outcome` rather than the recipient status anyway.
+  `issue_raised`, no-answer/busy/failed → `delivery_unreachable`. The order
+  script's `orderConfirmationStatusFor` is the mirror image, and both now send
+  every press-2 to `issue_raised`.
 - **A confirmed delivery seals a VOC** (`sealDeliveryVoc`), which is what the
   vault and the client report read. It needs both a `confirmed` outcome and a
   `recording_url`, and those arrive in an unpredictable order (the outcome from
@@ -155,7 +186,7 @@ the call still completes.
 | `callType` | no | `order_confirmation` (default) or `delivery_confirmation` — which script to run over the shared Exotel flow. The recipient's status is re-validated against it here (409 if it doesn't fit), since this places a real, billed call |
 | `phoneNumber` | no | Defaults to the recipient's `contact_no_e164` |
 | `statusCallbackUrl` | no | Defaults to this project's own `status-callback` function; override only to point at a different receiver |
-| `record` | no | Defaults to **`true`** so `status-callback` always has a `RecordingUrl` to attach; pass `record: false` per-call to opt out. This is a plain form field on `Calls/connect` (unlike `connect-support`'s `SUPPORT_RECORD`, which is validated against Exotel's stricter Connect-applet JSON schema and documented to drop the call if wrong), so it's expected to just have no effect on an account without call recording enabled rather than reject the request — worth confirming with one real test call before relying on it, since this hasn't been verified against a live Exotel account in this change |
+| `record` | no | Defaults to **`true`** so `status-callback` always has a `RecordingUrl` to attach; pass `record: false` per-call to opt out. This is a plain form field on `Calls/connect`, so on an account without call recording enabled it is expected to have no effect rather than reject the request — worth confirming with one real test call before relying on it, since this hasn't been verified against a live Exotel account |
 
 ```bash
 curl -X POST "$FUNCTIONS_URL/ivr-engine" \
@@ -230,30 +261,6 @@ and surfaced to the local edge runtime by the `[edge_runtime.secrets]` block in
 - `EXOTEL_CALLER_ID`
 - `EXOTEL_APP_ID`
 
-`connect-support` needs a support number. Only `SUPPORT_NUMBER` is required; the
-rest are optional and fall back to the defaults in `connect-support/config.ts`:
-- `SUPPORT_NUMBER` — the agent number (bare `7872944208`, country-coded, or
-  `+91...`; normalised to E.164). `SUPPORT_NUMBERS` (comma-separated) overrides
-  it for a hunt group.
-- `SUPPORT_COUNTRY_CODE` (default `91`), `SUPPORT_OUTGOING_PHONE_NUMBER`
-  (optional, **must be E.164**; omitted by default so Exotel uses the first-leg
-  ExoPhone), `SUPPORT_RECORD` (default `true`),
-  `SUPPORT_RECORDING_CHANNELS` (`single`|`dual`, default `dual`),
-  `SUPPORT_MAX_RINGING_DURATION` (default `30`, max `60`),
-  `SUPPORT_MAX_CONVERSATION_DURATION` (default `900`, max `4500`),
-  `SUPPORT_MUSIC_ON_HOLD_TYPE` (default `default_tone`), `SUPPORT_WAIT_MESSAGE`,
-  `SUPPORT_FETCH_AFTER_ATTEMPT` (default `false`),
-  `SUPPORT_CONNECT_STATUS` (the `call_attempts.outcome` value recorded on
-  transfer — a value from the `call_outcome` enum, not a recipient status;
-  default `transferred_to_agent`, which is what the escalations queue's
-  order-type filter looks for; set empty to disable the update).
-
-`connect-telecaller` needs no required secret of its own — it resolves the
-destination from each order's `telecaller_phone` at call time, falling back to
-`SUPPORT_NUMBER`/`SUPPORT_NUMBERS` above when a recipient has none on file.
-Its own knobs (`TELECALLER_*`) are all optional; see "Transferring to the
-assigned telecaller" below.
-
 `supabase start` has no `--env-file` flag — `env(...)` in `config.toml` is
 resolved from the **process environment**, so the file must be exported into the
 shell first. Verified procedure:
@@ -291,23 +298,43 @@ works as a fallback.
 | Applet | Type | URL | Switch Case routing |
 | --- | --- | --- | --- |
 | Call start | Gather | `<FUNCTIONS_URL>/dynamic-greeting/welcome` | 1 → address, 2 → issue |
-| Address confirm | Gather | `<FUNCTIONS_URL>/dynamic-greeting/address` | 1 → done, 2 → **Greeting → Connect** |
+| Address confirm | Gather | `<FUNCTIONS_URL>/dynamic-greeting/address` | 1 → done, **2 → issue** |
 | Closing (confirmed) | Gather | `<FUNCTIONS_URL>/dynamic-greeting/done` | → Greeting → Hangup |
-| Closing (order issue) | Gather | `<FUNCTIONS_URL>/dynamic-greeting/issue` | → Hangup |
+| Closing (issue raised) | Gather | `<FUNCTIONS_URL>/dynamic-greeting/issue` | → Hangup |
 
 These same four applets serve the delivery-confirmation script too, with
 different prompts — see "Two scripts, one Exotel app" above. The node names
 here are the order-confirmation vocabulary because that flow was built first;
 nothing in Exotel needs renaming or rewiring for the second script.
 
-The address-confirmation menu's "incorrect" branch (Case 2) does **not** call
-back into `dynamic-greeting` at all — there is no `address-issue` step. It
-goes straight to a Greeting (any static/dynamic Exotel greeting — e.g. "Please
-hold while we connect you to your telecaller") and then a **Connect** applet
-wired to `connect-telecaller` (see below), which resolves the order's
-assigned telecaller and live-transfers the call. That Connect applet's own
-Dynamic URL fetch is what records the `transferred_to_agent` outcome — no
-separate logging step is needed before it.
+### Migrating from the old transfer flow (**one-time Exotel change**)
+
+The Address confirm menu's "press 2" used to go to a Greeting and then a
+**Connect** applet that live-transferred the caller to their assigned
+telecaller. That is gone — the `connect-support` and `connect-telecaller`
+functions have been deleted from this repo.
+
+**If your Exotel flow still has those nodes, do this once:**
+
+1. On the **Address confirm** Gather's Switch Case, repoint **Case 2** from the
+   Greeting to the existing **Closing (issue raised)** Gather.
+2. Delete the now-orphaned **Greeting** and **Connect** applets.
+
+Until step 1 is done, a second-menu "press 2" still fetches the deleted
+`connect-telecaller` URL, which now 404s — Exotel drops the caller. The code
+change alone does not complete the migration.
+
+If you would rather keep a *separate* closing node for the second menu (to give
+it its own wording later), point that node at
+`<FUNCTIONS_URL>/dynamic-greeting/escalate` instead — `escalate` and
+`address-issue` are accepted aliases of `issue` and behave identically.
+
+If the functions are still deployed from a previous release, remove them:
+
+```bash
+supabase functions delete connect-support
+supabase functions delete connect-telecaller
+```
 
 Any unrecognised `step` on `dynamic-greeting` still returns a valid closing
 message rather than a 404.
@@ -318,102 +345,6 @@ applets above — it is not an applet at all. `ivr-engine` passes it as the
 `terminal` event), so Exotel calls it automatically once per call, with no
 Exotel-side configuration needed. See "Call recording & terminal status"
 below.
-
-### Transferring to a live agent (Connect applet)
-
-To let a caller reach the support team, add a **Connect** applet to the Exotel
-flow and point its **Dynamic URL** at `connect-support`:
-
-| Applet | URL | Purpose |
-| --- | --- | --- |
-| Connect (Dynamic URL) | `<FUNCTIONS_URL>/connect-support` | Dials the support number and bridges the caller |
-
-Exotel GETs this URL mid-call and expects an `application/json` body describing
-the destination and call settings. `connect-support` builds that body from the
-resolved config:
-
-```json
-{
-  "destination": { "numbers": ["+917872944208"] },
-  "fetch_after_attempt": false,
-  "record": true,
-  "recording_channels": "dual",
-  "max_ringing_duration": 30,
-  "max_conversation_duration": 900,
-  "music_on_hold": { "type": "default_tone" }
-}
-```
-
-Every value here must match Exotel's documented Connect contract exactly, or
-Exotel rejects the response and **drops the call** (it does not gracefully ignore
-a bad field). Two fields are therefore off by default:
-
-- `outgoing_phone_number` is **omitted** unless `SUPPORT_OUTGOING_PHONE_NUMBER`
-  is set. Exotel requires it to be a valid **E.164 ExoPhone**; when omitted it
-  dials the agent from the same ExoPhone as the first leg (the desired
-  behaviour). Do **not** point it at a non-E.164 number like `02249360074`.
-- `start_call_playback` is **omitted** unless `SUPPORT_WAIT_MESSAGE` is set. Its
-  `playback_to` only accepts documented values (`both` / `callee`), so it is a
-  common way to get the whole response rejected.
-
-The support number is read from `SUPPORT_NUMBER` today. Routing is deliberately
-loosely coupled: `config.ts` resolves the whole config behind a stable
-`ConnectConfig` type, so it can later be fetched per-order from the database
-without touching the Exotel mapping in `exotel.ts`. Exotel echoes `CustomField`
-(the order id) and `CallSid` to this URL, so a future DB resolver already has the
-context it needs to route.
-
-If no number is configured the endpoint returns HTTP 500 (not a broken 200), so
-Exotel runs its configured fallback instead of bridging the caller to dead air.
-
-When it serves a number, `connect-support` also records this call's outcome —
-`transferred_to_agent` by default (`SUPPORT_CONNECT_STATUS`) — by calling
-`update-order-status` fire-and-forget, the same way `dynamic-greeting` does. It
-never writes to `recipients` / `call_attempts` directly; that write stays owned
-by one function. The update is skipped for inbound calls that carry no order id.
-
-`connect-support` is not currently wired into either Switch Case branch of the
-live flow (the welcome menu's "issue" branch just Gathers and hangs up) — it's
-available if a future flow wants a live transfer to a generic support line.
-
-### Transferring to the assigned telecaller (address-issue Connect applet)
-
-The address-confirmation menu's "incorrect" branch (Case 2) needs its own
-Connect applet, added **after** its Greeting node, with its Dynamic URL
-pointed at `connect-telecaller`:
-
-| Applet | URL | Purpose |
-| --- | --- | --- |
-| Connect (Dynamic URL) | `<FUNCTIONS_URL>/connect-telecaller` | Dials the order's assigned telecaller and bridges the caller |
-
-`connect-telecaller` reads the same `CustomField` (order id) Exotel already
-carries, looks up that recipient's `telecaller_phone` (imported per-row in
-mjunction alongside `telecaller_name` — the "Tele Caller Contact No" import
-column), and returns the same Exotel Connect JSON shape as `connect-support`
-(shared in `_shared/connect.ts`, so both endpoints stay wire-compatible by
-construction). If the order has no `telecaller_phone` on file, it falls back
-to the account-wide `SUPPORT_NUMBER`/`SUPPORT_NUMBERS` — same env vars
-`connect-support` uses — so a data gap degrades to "reaches someone" instead
-of dropping the call. If neither resolves, the endpoint returns HTTP 500 so
-Exotel runs its configured fallback URL instead of bridging to dead air.
-
-Optional tuning env vars (all fall back to sane defaults in
-`connect-telecaller/config.ts` — only set what you need to change):
-`TELECALLER_COUNTRY_CODE` (default `91`), `TELECALLER_OUTGOING_PHONE_NUMBER`
-(must be E.164), `TELECALLER_RECORD` (default `false`),
-`TELECALLER_RECORDING_CHANNELS` (`single`|`dual`, default `single`),
-`TELECALLER_MAX_RINGING_DURATION` (default `30`, max `60`),
-`TELECALLER_MAX_CONVERSATION_DURATION` (default `900`, max `4500`),
-`TELECALLER_MUSIC_ON_HOLD_TYPE` (default `default_tone`),
-`TELECALLER_WAIT_MESSAGE`, `TELECALLER_FETCH_AFTER_ATTEMPT` (default `false`).
-
-On success it records the call's outcome as `transferred_to_agent` (the same
-outcome the escalations queue's order-type filter already looks for), via
-`update-order-status`, fire-and-forget. Once the telecaller has spoken to the
-caller and knows the correct address, they resolve it from the recipient's
-page in mjunction (the existing "Resolve escalation" action — enter the
-corrected address, or confirm it was unchanged), the same way a `SUPPORT_NUMBER`
-transfer would be resolved today.
 
 All Gather applets above conform to the same response contract; the closing
 messages are Gather applets too,
@@ -474,7 +405,6 @@ supabase db push
 # Deploy the functions
 supabase functions deploy ivr-engine --use-api
 supabase functions deploy dynamic-greeting --use-api
-supabase functions deploy connect-support --use-api
 supabase functions deploy update-order-status --use-api
 supabase functions deploy status-callback --use-api
 ```
@@ -487,10 +417,8 @@ mjunction's `recipients` / `call_attempts` / `recipient_events` tables (same
 Supabase project, so no API call between the two repos is needed for that).
 A recipient's status now updates progressively over the life of one call —
 `imported → order_confirm_pending` the moment the call is dialed, then to
-`address_confirmed` / `order_unreachable` (or left at `order_confirm_pending`
-for an address correction or agent transfer, matching mjunction's own
-`recordOrderConfirmationCall` mapping) once the outcome is known — rather than
-only once at the very end.
+`address_confirmed` / `issue_raised` / `order_unreachable` once the outcome is
+known — rather than only once at the very end.
 
 mjunction triggers both call types from its own UI when
 `TELEPHONY_PROVIDER=exotel`: "Call Now" on a recipient row calls

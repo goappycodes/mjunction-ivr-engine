@@ -272,7 +272,7 @@ function welcomePrompt(order: OrderRecord | null): string {
 
       To confirm your order, please press 1.
 
-      If you would like to report an issue or speak with our customer support team, please press 2.`;
+      If you would like to report an issue with this order, please press 2.`;
   }
 
   const greeting = order.customer_name
@@ -287,7 +287,7 @@ function welcomePrompt(order: OrderRecord | null): string {
 
     To confirm your order, please press 1.
 
-    If you would like to report an issue or speak with our customer support team, please press 2.`;
+    If you would like to report an issue with this order, please press 2.`;
 }
 
 function addressPrompt(order: OrderRecord | null): string {
@@ -310,24 +310,29 @@ function addressPrompt(order: OrderRecord | null): string {
     If there is an issue with this address, please press 2.`;
 }
 
-function closingPrompt(_order: OrderRecord | null, issue: boolean): string {
-  return issue
-    ? `Thank you for informing us.
+function orderConfirmedPrompt(): string {
+  return `Thank you for confirming your order.
 
-      Your concern has been recorded successfully.
+    Your order has been successfully confirmed and will be processed according to the delivery schedule.
 
-      Our customer support team will contact you shortly.
+    Thank you for choosing mjunction.
 
-      Thank you for choosing mjunction.
+    Goodbye.`;
+}
 
-      Goodbye.`
-    : `Thank you for confirming your order.
+/**
+ * The one closing for every "press 2", in both scripts.
+ *
+ * Deliberately identical wording whichever menu the caller pressed 2 on and
+ * whichever script they are in: at this point the only thing true of all four
+ * cases is that a person will follow up. Anything more specific would be a
+ * promise this function cannot keep — it does not know what the caller's
+ * problem is, only that they have one.
+ */
+function escalationPrompt(): string {
+  return `For your assistance, we're connecting you with our team now.
 
-      Your order has been successfully confirmed and will be processed according to the delivery schedule.
-
-      Thank you for choosing mjunction.
-
-      Goodbye.`;
+    One of our team members will call you shortly.`;
 }
 
 // --- delivery-confirmation script -----------------------------------------
@@ -367,9 +372,8 @@ function deliveryWelcomePrompt(order: OrderRecord | null): string {
 /**
  * Second-level menu, on the node the address prompt uses in the other script.
  * Having confirmed the parcel arrived, the caller now confirms the item
- * itself is right — and "press 2" reaches the same Connect applet, so a
- * damaged or wrong item puts them straight through to their telecaller
- * exactly as an address problem does.
+ * itself is right — and "press 2" raises an issue for an agent to pick up,
+ * exactly as an address problem does on the order script.
  */
 function deliveryItemPrompt(order: OrderRecord | null): string {
   if (!order?.product_name) {
@@ -377,7 +381,7 @@ function deliveryItemPrompt(order: OrderRecord | null): string {
 
       If the item you received is correct and in good condition, please press 1.
 
-      If there is any problem with the item, please press 2 to speak with your telecaller.`;
+      If there is any problem with the item, please press 2 to report it.`;
   }
 
   return `Thank you.
@@ -386,27 +390,17 @@ function deliveryItemPrompt(order: OrderRecord | null): string {
 
     If it is correct and in good condition, please press 1.
 
-    If there is any problem with the item, please press 2 to speak with your telecaller.`;
+    If there is any problem with the item, please press 2 to report it.`;
 }
 
-function deliveryClosingPrompt(issue: boolean): string {
-  return issue
-    ? `Thank you for informing us.
+function deliveryConfirmedPrompt(): string {
+  return `Thank you for confirming your delivery.
 
-      We are sorry your delivery has not reached you.
+    Your delivery has been successfully confirmed and this order is now complete.
 
-      Your concern has been recorded and our team will follow up with you shortly.
+    Thank you for choosing mjunction.
 
-      Thank you for choosing mjunction.
-
-      Goodbye.`
-    : `Thank you for confirming your delivery.
-
-      Your delivery has been successfully confirmed and this order is now complete.
-
-      Thank you for choosing mjunction.
-
-      Goodbye.`;
+    Goodbye.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -594,7 +588,7 @@ export default {
 
                To confirm your order, please press 1.
 
-               To report an issue or speak with our customer support team, please press 2.`,
+               To report an issue with this order, please press 2.`,
             );
 
           logEvent({
@@ -710,7 +704,7 @@ export default {
           }
 
           const response = speak(
-            isDelivery ? deliveryClosingPrompt(false) : closingPrompt(order, false),
+            isDelivery ? deliveryConfirmedPrompt() : orderConfirmedPrompt(),
           );
 
           logEvent({
@@ -734,25 +728,27 @@ export default {
           return response;
         }
 
-        // NOTE: the address Gather's "incorrect" branch does NOT come back
-        // here. It goes straight to a Greeting + Connect applet, wired to
-        // the `connect-telecaller` function, which resolves the assigned
-        // telecaller's phone and live-transfers the call — see that
-        // function and the README's flow diagram. This endpoint only ever
-        // serves prompts (Gather/Passthru), never a live transfer, so it
-        // has no "address-issue" step of its own.
-
-        // Reached via the welcome Gather's "issue" branch — an order-level
-        // issue (the caller wants to speak to an agent), or on the delivery
-        // script, a delivery that never arrived.
-        case "issue": {
+        // Every "press 2" in either script ends here — the welcome menu's
+        // branch and the second menu's branch alike.
+        //
+        // The second menu's branch used to go to a Greeting + Connect applet
+        // that live-transferred the caller. That transfer is gone: both
+        // branches now play the same escalation message and raise an issue for
+        // an agent to pick up from the escalations queue. Because both mean
+        // the same thing, they share one Exotel node — see the README's flow
+        // diagram. `escalate` / `address-issue` are accepted as aliases so a
+        // flow wired to a separate node for the second menu also works
+        // without needing this function redeployed in lockstep.
+        case "issue":
+        case "escalate":
+        case "address-issue": {
           logCallStep({
             callSid,
             callerNumber,
             orderId,
             step: "done",
             userInput: digits,
-            status: isDelivery ? "DELIVERY_NOT_RECEIVED" : "ORDER_ISSUE_RAISED",
+            status: isDelivery ? "DELIVERY_ISSUE_RAISED" : "ORDER_ISSUE_RAISED",
             appletHint,
           });
 
@@ -761,26 +757,22 @@ export default {
               orderId,
               callSid,
               callerNumber,
-              // A delivery that never arrived is a terminal `issue_raised`
-              // (it moves the recipient there and lands in the issues view);
-              // an order-level "press 2" is a request for a human, which is
-              // what `transferred_to_agent` means. Same node, same digit,
-              // different business fact.
-              outcome: isDelivery ? "issue_raised" : "transferred_to_agent",
+              // One outcome for every press-2, in both scripts: the recipient
+              // moves to `issue_raised` and an agent takes it from the
+              // escalations queue.
+              outcome: "issue_raised",
             });
           }
 
-          const response = speak(
-            isDelivery ? deliveryClosingPrompt(true) : closingPrompt(order, true),
-          );
+          const response = speak(escalationPrompt());
 
           logEvent({
             fn: "dynamic-greeting",
             level: orderDegraded || !orderId ? "warning" : "success",
             event: "closing_served",
             message: isDelivery
-              ? "Closing message served (delivery not received)"
-              : "Closing message served (order issue)",
+              ? "Escalation message served (delivery issue)"
+              : "Escalation message served (order issue)",
             method: req.method,
             url: req.url,
             params: allParams,
