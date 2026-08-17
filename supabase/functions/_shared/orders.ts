@@ -20,6 +20,7 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import {
   canTransition,
   type CallOutcome,
+  deliveryConfirmationStatusFor,
   orderConfirmationStatusFor,
   type RecipientStatus,
 } from "./status.ts";
@@ -353,6 +354,32 @@ export function resolveOrderConfirmationOutcome(
   return "confirmed";
 }
 
+/**
+ * Delivery-confirmation outcome from the same two Gather answers, read against
+ * the delivery script instead of the address one (welcome-menu digit = "did
+ * you receive it", second-menu digit = "is the item right"). The shapes match
+ * because both scripts run on the same Exotel flow graph — see
+ * `_shared/flow.ts` — but the meanings do not, which is why this is a separate
+ * function rather than a shared one with a flag:
+ *
+ *   - second menu "2" (item wrong/damaged) -> `issue_raised`, the terminal
+ *     "something went wrong with this delivery" outcome. Note the caller is
+ *     *also* live-transferred to their telecaller on this branch, and that
+ *     Connect applet records `transferred_to_agent` first; whichever lands
+ *     first wins, since finalizing is idempotent (see update-order-status).
+ *   - welcome "2" (never received it) -> `issue_raised` too. A non-delivery is
+ *     an issue with this delivery, not an unreachable call.
+ *   - otherwise -> a clean `confirmed`, which is what seals the VOC.
+ */
+export function resolveDeliveryConfirmationOutcome(
+  welcomeDigit: string,
+  itemDigit: string,
+): CallOutcome {
+  if (itemDigit === "2") return "issue_raised";
+  if (welcomeDigit === "2") return "issue_raised";
+  return "confirmed";
+}
+
 // ---------------------------------------------------------------------------
 // call_attempts lifecycle — the same table + shape the mock provider writes
 // (src/lib/domain/call-flow.ts in mjunction), just opened at dial time and
@@ -670,19 +697,123 @@ export async function finalizeCallAttempt(
     },
   });
 
-  if (params.callType === "order_confirmation") {
-    const to = orderConfirmationStatusFor(params.outcome, params.from);
-    if (to !== params.from) {
-      await transitionRecipientStatus({
-        recipientId: params.recipientId,
-        from: params.from,
-        to,
-        payload: { via: "order_confirmation", outcome: params.outcome },
-      });
-    }
+  const to = params.callType === "delivery_confirmation"
+    ? deliveryConfirmationStatusFor(params.outcome, params.from)
+    : orderConfirmationStatusFor(params.outcome, params.from);
+
+  if (to !== params.from) {
+    await transitionRecipientStatus({
+      recipientId: params.recipientId,
+      from: params.from,
+      to,
+      payload: { via: params.callType, outcome: params.outcome },
+    });
+  }
+
+  // A confirmed delivery is what seals a VOC. Attempted here as well as from
+  // status-callback because the two signals arrive in an order this function
+  // cannot predict — the outcome usually lands first (the caller finished the
+  // menu) but the recording only exists once Exotel's terminal callback
+  // fires. sealDeliveryVoc is idempotent, so whichever arrives second is the
+  // one that actually seals.
+  if (params.callType === "delivery_confirmation" && params.outcome === "confirmed") {
+    await sealDeliveryVoc(params.callAttemptId);
   }
 
   notifyPortalCallRecordsRefresh(params.recipientId);
+}
+
+/**
+ * Human-facing sealed VOC id. Same format the admin panel's own mock path
+ * mints (`sealedVocId` in mjunction's src/lib/domain/call-flow.ts) so a real
+ * and a mock recording are indistinguishable in the vault and in the client
+ * report.
+ */
+function sealedVocId(): string {
+  const now = new Date();
+  const stamp = now.getUTCFullYear().toString() +
+    String(now.getUTCMonth() + 1).padStart(2, "0") +
+    String(now.getUTCDate()).padStart(2, "0");
+  const rand = Math.floor(Math.random() * 1e6).toString(36).toUpperCase().padStart(4, "0");
+  return `VOC-${stamp}-${rand}`;
+}
+
+/**
+ * Seal the VOC for a confirmed delivery-confirmation call, if it is ready to
+ * be sealed and has not been already.
+ *
+ * "Ready" means the call_attempts row has both a `confirmed` outcome and a
+ * `recording_url` — a sealed VOC with nothing to play back would be a lie in
+ * the client report. Called from both sides of that race (finalizeCallAttempt
+ * and status-callback) and safe to run repeatedly: it returns early if a
+ * voc_recordings row already exists for this attempt.
+ *
+ * `storage_path` holds Exotel's own recording URL rather than a Supabase
+ * Storage object key. The column is `not null` and this audio genuinely lives
+ * outside the `voc` bucket — it is never uploaded — so mjunction's
+ * `getSignedVocUrl` hands an absolute URL straight back instead of trying to
+ * sign it.
+ */
+export async function sealDeliveryVoc(callAttemptId: string): Promise<void> {
+  const client = db();
+  if (!client || !callAttemptId) return;
+
+  const { data: existing, error: existingError } = await client
+    .from("voc_recordings")
+    .select("id")
+    .eq("call_attempt_id", callAttemptId)
+    .maybeSingle();
+
+  if (existingError) {
+    console.error("[sealDeliveryVoc] existing lookup failed:", existingError.code, existingError.message);
+    return;
+  }
+  if (existing) return;
+
+  const { data: attempt, error: attemptError } = await client
+    .from("call_attempts")
+    .select("id, recipient_id, campaign_id, call_type, outcome, language, dtmf_response, recording_url")
+    .eq("id", callAttemptId)
+    .maybeSingle();
+
+  if (attemptError) {
+    console.error("[sealDeliveryVoc] attempt lookup failed:", attemptError.code, attemptError.message);
+    return;
+  }
+  // Not an error — this is the normal "the other half hasn't arrived yet" case.
+  if (!attempt || attempt.call_type !== "delivery_confirmation") return;
+  if (attempt.outcome !== "confirmed" || !attempt.recording_url) return;
+
+  const { data: recipient } = await client
+    .from("recipients")
+    .select("product_name")
+    .eq("id", attempt.recipient_id)
+    .maybeSingle();
+
+  const sealed = sealedVocId();
+  const { error } = await client.from("voc_recordings").insert({
+    sealed_voc_id: sealed,
+    recipient_id: attempt.recipient_id,
+    campaign_id: attempt.campaign_id,
+    call_attempt_id: attempt.id,
+    call_type: "delivery_confirmation",
+    product_name: recipient?.product_name ?? null,
+    caller_type: "ivr",
+    language: attempt.language,
+    dtmf_outcome: attempt.dtmf_response,
+    storage_path: attempt.recording_url,
+  });
+
+  if (error) {
+    console.error("[sealDeliveryVoc] insert failed:", error.code, error.message);
+    return;
+  }
+
+  await logRecipientEvent({
+    recipientId: attempt.recipient_id as string,
+    eventType: "voc_sealed",
+    payload: { sealed_voc_id: sealed, language: attempt.language },
+  });
 }
 
 /**

@@ -9,6 +9,12 @@ import {
   upsertCallLog,
 } from "../_shared/orders.ts";
 import { type LogLevel, logEvent } from "../_shared/logging.ts";
+import {
+  type CallFlow,
+  DELIVERY_CALLABLE,
+  encodeCustomField,
+  ORDER_CALLABLE,
+} from "../_shared/flow.ts";
 
 const JSON_HEADERS = {
   "Content-Type": "application/json",
@@ -21,11 +27,48 @@ function json(body: unknown, status: number) {
 
 interface StartCallBody {
   orderId?: string;
+  /**
+   * Which script to run. Defaults to `order_confirmation` so every existing
+   * caller keeps working unchanged. Both run on the same Exotel app — see
+   * `_shared/flow.ts`.
+   */
+  callType?: CallFlow;
   phoneNumber?: string;
   language?: string;
   statusCallbackUrl?: string;
   record?: boolean;
 }
+
+/**
+ * The recipient statuses each script is valid for, and the status a call
+ * bootstraps the recipient into before its outcome is known. Mirrors
+ * `recordOrderConfirmationCall`'s "ensure enqueued" step in mjunction, and the
+ * equivalent `delivered -> delivery_confirm_pending` move for the second half
+ * of the pipeline. Recipients already in flight (…_pending) or being retried
+ * (…_unreachable) are left alone; canTransition would reject a sideways move
+ * anyway.
+ */
+const FLOW_RULES: Record<
+  CallFlow,
+  { callable: string[]; bootstrapFrom: string; bootstrapTo: string; label: string }
+> = {
+  order_confirmation: {
+    callable: [...ORDER_CALLABLE],
+    bootstrapFrom: "imported",
+    bootstrapTo: "order_confirm_pending",
+    label: "order confirmation",
+  },
+  delivery_confirmation: {
+    // `delivered` is included so a single call can both enqueue the recipient
+    // and run the confirmation, matching how "Mark as delivered" then "Run
+    // confirmation call" behaves in the admin panel — without forcing the
+    // caller to make two requests.
+    callable: [...DELIVERY_CALLABLE, "delivered"],
+    bootstrapFrom: "delivered",
+    bootstrapTo: "delivery_confirm_pending",
+    label: "delivery confirmation",
+  },
+};
 
 export default {
   fetch: async (req: Request) => {
@@ -98,6 +141,20 @@ export default {
         return json({ success: false, error: "orderId is required" }, 400);
       }
 
+      const callType: CallFlow = body.callType ?? "order_confirmation";
+      const rules = FLOW_RULES[callType];
+      if (!rules) {
+        log("warning", "call_type_invalid", `Unknown callType: ${body.callType}`, 400, { orderId });
+        return json(
+          {
+            success: false,
+            error: `Unknown callType: ${body.callType}`,
+            hint: "Expected 'order_confirmation' or 'delivery_confirmation'",
+          },
+          400,
+        );
+      }
+
       // The order is the source of truth for the whole flow, so resolve it up
       // front. `phoneNumber` is optional: when omitted we dial the number on the
       // order record, which is the normal case for an outbound campaign.
@@ -149,18 +206,42 @@ export default {
         );
       }
 
-      // The recipient is now "in a call" for order confirmation — bootstrap
-      // it out of `imported` before the outcome is known, mirroring
+      // Refuse to run the wrong script at the wrong point in the pipeline —
+      // a delivery-confirmation call to someone whose address isn't confirmed
+      // yet would ask them to confirm a delivery that was never dispatched.
+      // Checked here rather than trusted from the caller because this
+      // endpoint places a real, billed call.
+      if (!rules.callable.includes(order.status)) {
+        log(
+          "warning",
+          "status_not_callable",
+          `Order ${orderId} is ${order.status}; not eligible for ${rules.label}`,
+          409,
+          { orderId },
+        );
+        return json(
+          {
+            success: false,
+            error:
+              `Order ${orderId} is in status "${order.status}", which is not eligible for a ${rules.label} call`,
+            hint: `Eligible statuses: ${rules.callable.join(", ")}`,
+          },
+          409,
+        );
+      }
+
+      // The recipient is now "in a call" — bootstrap it into the pending
+      // status before the outcome is known, mirroring
       // recordOrderConfirmationCall's "ensure enqueued" step in mjunction.
-      // Already-in-flight/retry recipients (order_confirm_pending,
-      // order_unreachable) are left as-is; canTransition would reject moving
-      // sideways into the same or a non-adjacent status anyway.
-      if (order.status === "imported") {
+      // Already-in-flight/retry recipients are left as-is; canTransition
+      // would reject moving sideways into the same or a non-adjacent status
+      // anyway.
+      if (order.status === rules.bootstrapFrom) {
         await transitionRecipientStatus({
           recipientId: order.recipient_id,
           from: order.status,
-          to: "order_confirm_pending",
-          payload: { via: "order_confirmation", reason: "call_initiated" },
+          to: rules.bootstrapTo as typeof order.status,
+          payload: { via: callType, reason: "call_initiated" },
         });
       }
 
@@ -171,12 +252,12 @@ export default {
       const attempt = await startCallAttempt({
         recipientId: order.recipient_id,
         campaignId: order.campaign_id,
-        callType: "order_confirmation",
+        callType,
       });
 
       const callRequest: ExotelCallRequest = {
         phoneNumber,
-        orderId,
+        customField: encodeCustomField(orderId, callType),
         language: body.language,
         // Default to this project's own status-callback function so a
         // recording URL / no-answer outcome is captured even when the caller
@@ -228,6 +309,7 @@ export default {
         callSid: result.providerCallRef,
         status: result.status,
         orderId,
+        callType,
         phoneNumber,
       }, 200);
     } catch (error) {

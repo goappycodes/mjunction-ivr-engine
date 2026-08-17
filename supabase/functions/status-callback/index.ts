@@ -5,10 +5,12 @@ import {
   getOpenCallAttemptByCallSid,
   getRecipientStatus,
   logCallStep,
+  sealDeliveryVoc,
   terminalStatusOutcome,
   updateProviderStatus,
 } from "../_shared/orders.ts";
 import { logEvent } from "../_shared/logging.ts";
+import { parseCustomField } from "../_shared/flow.ts";
 
 const JSON_HEADERS = {
   "Content-Type": "application/json",
@@ -95,7 +97,12 @@ export default {
       const params = await readParams(req, url);
       const allParams = Object.fromEntries(params.entries());
       const callSid = firstOf(params, "CallSid", "call_sid");
-      const orderId = firstOf(params, "CustomField", "custom_field");
+      // CustomField carries the flow suffix as well as the order id; only the
+      // id is wanted here (the call's own call_attempts row is the
+      // authoritative record of which script ran).
+      const { orderId } = parseCustomField(
+        firstOf(params, "CustomField", "custom_field"),
+      );
       const exotelStatus = firstOf(params, "Status", "CallStatus", "status");
       const recordingUrl = firstOf(params, "RecordingUrl", "recording_url");
       const duration = firstOf(params, "Duration", "DialCallDuration", "duration");
@@ -163,6 +170,15 @@ export default {
           recordingUrl,
           providerCallRef: callSid,
         });
+      }
+
+      // The other half of the VOC-sealing race: a delivery call that was
+      // already confirmed by the Gather flow has been waiting for exactly
+      // this recording URL. No-op for every other call. Idempotent, so the
+      // finalize path below (and a repeat delivery of this callback) can both
+      // call it safely.
+      if (recordingUrl && attempt.callType === "delivery_confirmation") {
+        await sealDeliveryVoc(attempt.id);
       }
 
       // Only finalize from the terminal status when the Gather flow never
