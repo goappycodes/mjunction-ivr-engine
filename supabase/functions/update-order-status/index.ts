@@ -26,8 +26,8 @@ interface UpdateOrderStatusBody {
   callerNumber?: string;
   dtmf?: string;
   /**
-   * Explicit outcome set by non-keypress triggers (e.g. connect-support
-   * marking the call `transferred_to_agent`). Takes precedence over `dtmf`.
+   * Explicit outcome sent by dynamic-greeting when the step reached already
+   * determines the result. Takes precedence over `dtmf`.
    */
   outcome?: string;
 }
@@ -41,7 +41,7 @@ interface UpdateOrderStatusBody {
 // write isolated here means it can be redeployed, retried, or re-authored
 // without touching the live call flow.
 //
-// This is called by dynamic-greeting/connect-support as a fire-and-forget
+// This is called by dynamic-greeting as a fire-and-forget
 // request, but it still has to respond quickly and correctly on its own: if
 // it is ever called directly (manual retry, admin tooling), the same
 // 5-second-budget discipline applies — a couple of DB round trips at most.
@@ -173,7 +173,7 @@ export default {
         return json({ success: false, error: `Recipient not found: ${orderId}` }, 404);
       }
 
-      // An explicit outcome (connect-support's transfer) wins outright. Only
+      // An explicit outcome (the terminal step's own result) wins outright. Only
       // a keypress needs the extra lookup: the second-menu digit alone is
       // ambiguous without the welcome-menu digit from the previous step (see
       // resolveOrderConfirmationOutcome), so that read only happens on this
