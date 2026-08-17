@@ -5,6 +5,7 @@ import {
   getOpenCallAttemptByCallSid,
   getPriorStepInput,
   getRecipientStatus,
+  resolveDeliveryConfirmationOutcome,
   resolveOrderConfirmationOutcome,
 } from "../_shared/orders.ts";
 import { type LogLevel, logEvent } from "../_shared/logging.ts";
@@ -173,15 +174,21 @@ export default {
       }
 
       // An explicit outcome (connect-support's transfer) wins outright. Only
-      // a keypress needs the extra lookup: the address-menu digit alone is
+      // a keypress needs the extra lookup: the second-menu digit alone is
       // ambiguous without the welcome-menu digit from the previous step (see
       // resolveOrderConfirmationOutcome), so that read only happens on this
       // path, which is already off Exotel's response critical path.
+      //
+      // Which resolver applies comes from the call_attempts row this call
+      // opened, not from anything the notification carries — the two scripts
+      // share one Exotel flow and therefore the same digits, so the row is
+      // the only trustworthy record of what those digits meant.
+      const resolveOutcome = attempt.callType === "delivery_confirmation"
+        ? resolveDeliveryConfirmationOutcome
+        : resolveOrderConfirmationOutcome;
+
       const outcome: CallOutcome = explicitOutcome ||
-        resolveOrderConfirmationOutcome(
-          await getPriorStepInput(callSid, "address"),
-          dtmf,
-        );
+        resolveOutcome(await getPriorStepInput(callSid, "address"), dtmf);
 
       await finalizeCallAttempt({
         callAttemptId: attempt.id,

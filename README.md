@@ -38,10 +38,68 @@ mock call — see "How the order id flows through the call" below.
 
 `supabase/functions/_shared/`
 - `orders.ts` - recipient lookups, call_attempts lifecycle, call logging,
-  timeout guard (used by all)
+  VOC sealing, timeout guard (used by all)
 - `status.ts` - the recipient status machine, hand-kept in sync with
   mjunction's `src/lib/domain/status.ts`
+- `flow.ts` - which of the two scripts (order / delivery confirmation) a call
+  is running, and how that rides along in Exotel's `CustomField`
 - `logging.ts` - structured per-request console logging
+
+## Two scripts, one Exotel app
+
+There are two IVR scripts — **order confirmation** and **delivery
+confirmation** — and they share **one Exotel app, one App ID and one flow**.
+Nothing in the Exotel flow builder changes to add the second one.
+
+That works because the two scripts have the same shape (a welcome menu, a
+second-level confirm menu on "press 1", a closing message per terminal branch,
+a live transfer on the second-level "press 2") and because every word a caller
+hears is served by this project's own dynamic URLs. Exotel only ever decides
+*which URL to call*; this project decides *what that URL says*:
+
+| Exotel node (unchanged) | `order_confirmation` | `delivery_confirmation` |
+| --- | --- | --- |
+| Gather `/welcome` | confirm the order | did you receive the delivery |
+| Gather `/address` (case 1) | confirm the address | confirm the item delivered |
+| Gather `/done` (case 1→1) | address confirmed | delivery confirmed |
+| Gather `/issue` (case 2) | order issue → agent | never received → issue raised |
+| Connect (case 1→2) | → assigned telecaller | → assigned telecaller |
+
+In both scripts `1` means "all good" and `2` means "something is wrong", so the
+existing Switch Case wiring stays valid either way.
+
+Which script to read travels with the call in `CustomField`, the one per-call
+value Exotel echoes to every applet request. `ivr-engine` encodes it as
+`<recipients.unique_id>|oc` or `<recipients.unique_id>|dc`; every applet
+endpoint decodes it with `parseCustomField` (`_shared/flow.ts`). Encoding it
+there rather than looking it up per request keeps each endpoint on its single
+-DB-read budget — Exotel abandons an applet URL after 5 seconds.
+
+**A missing suffix means order confirmation**, so calls placed before this
+existed, and inbound calls (which carry no `CustomField` at all), behave
+exactly as they did. When the suffix is absent but the recipient *is* resolved,
+the flow is inferred from that recipient's status
+(`delivery_confirm_pending`/`delivery_unreachable` → delivery) as a safety net.
+
+### What a delivery-confirmation call writes
+
+Same tables as an order-confirmation call, with two differences:
+
+- **Status transitions** follow `deliveryConfirmationStatusFor`
+  (`_shared/status.ts`): `confirmed` → `confirmed`, `issue_raised` →
+  `issue_raised`, no-answer/busy/failed → `delivery_unreachable`. A live
+  transfer (`transferred_to_agent`) deliberately leaves the recipient at
+  `delivery_confirm_pending` until the telecaller resolves it — same posture
+  the order side takes, and the escalations queue keys off
+  `call_attempts.outcome` rather than the recipient status anyway.
+- **A confirmed delivery seals a VOC** (`sealDeliveryVoc`), which is what the
+  vault and the client report read. It needs both a `confirmed` outcome and a
+  `recording_url`, and those arrive in an unpredictable order (the outcome from
+  the Gather flow, the recording from Exotel's terminal StatusCallback), so it
+  is attempted from both sides and is idempotent — whichever lands second
+  actually seals. `voc_recordings.storage_path` holds Exotel's own recording
+  URL rather than a Supabase Storage key for these; mjunction's
+  `getSignedVocUrl` returns an absolute URL as-is instead of trying to sign it.
 
 ## How the order id flows through the call
 
@@ -94,6 +152,7 @@ the call still completes.
 | Field | Required | Notes |
 | --- | --- | --- |
 | `orderId` | **yes** | Must be a `recipients.unique_id`; 404 otherwise |
+| `callType` | no | `order_confirmation` (default) or `delivery_confirmation` — which script to run over the shared Exotel flow. The recipient's status is re-validated against it here (409 if it doesn't fit), since this places a real, billed call |
 | `phoneNumber` | no | Defaults to the recipient's `contact_no_e164` |
 | `statusCallbackUrl` | no | Defaults to this project's own `status-callback` function; override only to point at a different receiver |
 | `record` | no | Defaults to **`true`** so `status-callback` always has a `RecordingUrl` to attach; pass `record: false` per-call to opt out. This is a plain form field on `Calls/connect` (unlike `connect-support`'s `SUPPORT_RECORD`, which is validated against Exotel's stricter Connect-applet JSON schema and documented to drop the call if wrong), so it's expected to just have no effect on an account without call recording enabled rather than reject the request — worth confirming with one real test call before relying on it, since this hasn't been verified against a live Exotel account in this change |
@@ -104,13 +163,28 @@ curl -X POST "$FUNCTIONS_URL/ivr-engine" \
   -d '{"orderId":"<recipients.unique_id>"}'
 ```
 
-Returns `{ success, callSid, status, orderId, phoneNumber }`. A 200 means Exotel
-accepted the request, not that the call connected — the outcome arrives via
-the Gather flow finishing or via `status-callback`. Statuses: `queued`, `in-progress`,
-`completed`, `failed`, `busy`, `no-answer`.
+```bash
+curl -X POST "$FUNCTIONS_URL/ivr-engine" \
+  -H 'Content-Type: application/json' \
+  -d '{"orderId":"<recipients.unique_id>","callType":"delivery_confirmation"}'
+```
 
-Errors: 400 missing `orderId`, 404 unknown `orderId`, 422 no phone number
-available, 405 wrong method, 503 Exotel env vars missing, 502 Exotel rejected it.
+Returns `{ success, callSid, status, orderId, callType, phoneNumber }`. A 200
+means Exotel accepted the request, not that the call connected — the outcome
+arrives via the Gather flow finishing or via `status-callback`. Statuses:
+`queued`, `in-progress`, `completed`, `failed`, `busy`, `no-answer`.
+
+Errors: 400 missing `orderId` or unknown `callType`, 404 unknown `orderId`,
+409 the recipient's status isn't eligible for that `callType`, 422 no phone
+number available, 405 wrong method, 503 Exotel env vars missing, 502 Exotel
+rejected it.
+
+Eligible statuses per `callType`:
+
+| `callType` | Eligible `recipients.status` | Bootstrapped to on dial |
+| --- | --- | --- |
+| `order_confirmation` | `imported`, `order_confirm_pending`, `order_unreachable` | `imported` → `order_confirm_pending` |
+| `delivery_confirmation` | `delivered`, `delivery_confirm_pending`, `delivery_unreachable` | `delivered` → `delivery_confirm_pending` |
 
 ## Database prerequisites
 
@@ -220,6 +294,11 @@ works as a fallback.
 | Address confirm | Gather | `<FUNCTIONS_URL>/dynamic-greeting/address` | 1 → done, 2 → **Greeting → Connect** |
 | Closing (confirmed) | Gather | `<FUNCTIONS_URL>/dynamic-greeting/done` | → Greeting → Hangup |
 | Closing (order issue) | Gather | `<FUNCTIONS_URL>/dynamic-greeting/issue` | → Hangup |
+
+These same four applets serve the delivery-confirmation script too, with
+different prompts — see "Two scripts, one Exotel app" above. The node names
+here are the order-confirmation vocabulary because that flow was built first;
+nothing in Exotel needs renaming or rewiring for the second script.
 
 The address-confirmation menu's "incorrect" branch (Case 2) does **not** call
 back into `dynamic-greeting` at all — there is no `address-issue` step. It
@@ -413,14 +492,16 @@ for an address correction or agent transfer, matching mjunction's own
 `recordOrderConfirmationCall` mapping) once the outcome is known — rather than
 only once at the very end.
 
-**Not yet done, and out of scope for this change:** mjunction's own
-`TelephonyProvider` abstraction (`src/lib/telephony/`) has no `ExotelProvider`
-— `TELEPHONY_PROVIDER` is still hardcoded to `mock`, and mjunction's "Call Now"
-button in the admin panel does not call this repo's `/ivr-engine` endpoint.
-Wiring that up is a separate, larger piece of work: mjunction's
-`PlaceCallInput`/`PlaceCallResult` contract assumes a call resolves
-synchronously (fits a mock call, not a real one that plays out over many
-independent Exotel requests), and `app/api/telephony/webhook/route.ts` is
-still the original Phase-1 stub. Until that lands, a real call has to be
-triggered directly against this repo's `/ivr-engine` endpoint (e.g. from a
-script, or a temporary admin action) rather than from the mjunction UI.
+mjunction triggers both call types from its own UI when
+`TELEPHONY_PROVIDER=exotel`: "Call Now" on a recipient row calls
+`triggerOrderConfirmationCall`, "Run confirmation call" calls
+`triggerDeliveryConfirmationCall`, and both land on this repo's
+`/ivr-engine` endpoint (`src/lib/telephony/ivr-engine-client.ts`). Neither
+goes through mjunction's `TelephonyProvider.placeCall` contract — that assumes
+a call resolves synchronously, which fits a mock call but not a real one that
+plays out over many independent Exotel requests. `ExotelProvider.placeCall`
+therefore exists only to throw, so a real deployment can never silently fall
+back to mock outcomes.
+
+With `TELEPHONY_PROVIDER=mock` (the default) both buttons keep running
+mjunction's own simulated call instead, writing the same tables.

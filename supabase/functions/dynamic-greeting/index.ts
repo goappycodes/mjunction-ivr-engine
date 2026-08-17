@@ -9,6 +9,11 @@ import {
   withTimeout,
 } from "../_shared/orders.ts";
 import { logEvent } from "../_shared/logging.ts";
+import {
+  type CallFlow,
+  inferFlowFromStatus,
+  parseCustomField,
+} from "../_shared/flow.ts";
 
 const JSON_HEADERS = {
   "Content-Type": "application/json",
@@ -192,10 +197,22 @@ function readDigits(params: URLSearchParams): string {
  */
 async function resolveOrder(
   params: URLSearchParams,
-): Promise<{ order: OrderRecord | null; orderId: string; source: string }> {
-  const customField = firstOf(params, "CustomField", "custom_field");
+): Promise<{
+  order: OrderRecord | null;
+  orderId: string;
+  source: string;
+  flow: CallFlow;
+}> {
+  const rawCustomField = firstOf(params, "CustomField", "custom_field");
   const callSid = firstOf(params, "CallSid", "call_sid");
   const from = firstOf(params, "CallFrom", "From", "caller_number");
+
+  // The flow suffix ivr-engine encoded into CustomField is the authoritative
+  // signal for which script to read, and it costs nothing to recover. When
+  // it's absent — an inbound call, or a provider that mangled the field — the
+  // recipient's own status is the fallback, resolved below once the order is
+  // known. See _shared/flow.ts.
+  const { orderId: customField, flow: declaredFlow } = parseCustomField(rawCustomField);
 
   const resolved = await withTimeout(
     (async () => {
@@ -229,11 +246,22 @@ async function resolveOrder(
     "resolveOrder",
   );
 
-  return resolved;
+  return {
+    ...resolved,
+    flow: declaredFlow ?? inferFlowFromStatus(resolved.order?.status),
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Prompt construction — every prompt is built from the resolved order
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Prompts come in pairs — one per script — because the same four Exotel flow
+// nodes serve both (see _shared/flow.ts). Each pair keeps the same digit
+// meanings (1 = all good, 2 = something is wrong) so a caller who has taken
+// both calls hears a consistent menu, and so the Switch Case wiring in Exotel
+// stays valid for either script without being touched.
 // ---------------------------------------------------------------------------
 
 function welcomePrompt(order: OrderRecord | null): string {
@@ -296,6 +324,85 @@ function closingPrompt(_order: OrderRecord | null, issue: boolean): string {
     : `Thank you for confirming your order.
 
       Your order has been successfully confirmed and will be processed according to the delivery schedule.
+
+      Thank you for choosing mjunction.
+
+      Goodbye.`;
+}
+
+// --- delivery-confirmation script -----------------------------------------
+
+/**
+ * Delivery welcome menu, on the same node as the order-confirmation welcome.
+ * "Press 1 = received" / "press 2 = not received" — the digits keep their
+ * "all good" / "something is wrong" meanings, so Exotel's Switch Case routes
+ * a non-delivery to the same `issue` closing branch the order script uses.
+ */
+function deliveryWelcomePrompt(order: OrderRecord | null): string {
+  if (!order) {
+    return `Welcome to mjunction.
+
+      This is an automated call regarding the delivery of your recent order.
+
+      If you have received your delivery, please press 1.
+
+      If you have not received it yet, please press 2.`;
+  }
+
+  const greeting = order.customer_name
+    ? `Hello ${order.customer_name}.`
+    : "Hello.";
+  const item = order.product_name ? ` for ${order.product_name}` : "";
+
+  return `${greeting} Welcome to mjunction.
+
+    This is an automated call regarding the delivery of your order
+    ${spellReference(order.order_id)}${item}.
+
+    If you have received your delivery, please press 1.
+
+    If you have not received it yet, please press 2.`;
+}
+
+/**
+ * Second-level menu, on the node the address prompt uses in the other script.
+ * Having confirmed the parcel arrived, the caller now confirms the item
+ * itself is right — and "press 2" reaches the same Connect applet, so a
+ * damaged or wrong item puts them straight through to their telecaller
+ * exactly as an address problem does.
+ */
+function deliveryItemPrompt(order: OrderRecord | null): string {
+  if (!order?.product_name) {
+    return `Thank you.
+
+      If the item you received is correct and in good condition, please press 1.
+
+      If there is any problem with the item, please press 2 to speak with your telecaller.`;
+  }
+
+  return `Thank you.
+
+    Please confirm the item you received: ${order.product_name}.
+
+    If it is correct and in good condition, please press 1.
+
+    If there is any problem with the item, please press 2 to speak with your telecaller.`;
+}
+
+function deliveryClosingPrompt(issue: boolean): string {
+  return issue
+    ? `Thank you for informing us.
+
+      We are sorry your delivery has not reached you.
+
+      Your concern has been recorded and our team will follow up with you shortly.
+
+      Thank you for choosing mjunction.
+
+      Goodbye.`
+    : `Thank you for confirming your delivery.
+
+      Your delivery has been successfully confirmed and this order is now complete.
 
       Thank you for choosing mjunction.
 
@@ -410,7 +517,8 @@ export default {
       const step = stepParam;
       const appletHint = "gather";
 
-      const { order, orderId, source } = await resolveOrder(params);
+      const { order, orderId, source, flow } = await resolveOrder(params);
+      const isDelivery = flow === "delivery_confirmation";
       // Order resolution failing/timing out is not fatal (the prompt
       // degrades to generic wording), but it is anomalous enough to flag —
       // every log below is "warning" instead of "success" whenever that
@@ -471,22 +579,31 @@ export default {
             appletHint,
           });
 
-          const response = gather(
-            welcomePrompt(order),
-            `We did not receive a valid response.
+          const response = isDelivery
+            ? gather(
+              deliveryWelcomePrompt(order),
+              `We did not receive a valid response.
 
-             To confirm your order, please press 1.
+               If you have received your delivery, please press 1.
 
-             To report an issue or speak with our customer support team, please press 2.`,
-          );
+               If you have not received it yet, please press 2.`,
+            )
+            : gather(
+              welcomePrompt(order),
+              `We did not receive a valid response.
+
+               To confirm your order, please press 1.
+
+               To report an issue or speak with our customer support team, please press 2.`,
+            );
 
           logEvent({
             fn: "dynamic-greeting",
             level: orderDegraded ? "warning" : "success",
             event: "welcome_served",
             message: order
-              ? "Welcome prompt served for resolved order"
-              : "Welcome prompt served with NO order resolved (generic wording)",
+              ? `Welcome prompt served for resolved order (${flow})`
+              : `Welcome prompt served with NO order resolved (generic wording, ${flow})`,
             method: req.method,
             url: req.url,
             params: allParams,
@@ -515,24 +632,35 @@ export default {
             orderId,
             step: "address",
             userInput: digits,
-            status: "ADDRESS_PROMPT_SERVED",
+            status: isDelivery ? "DELIVERY_ITEM_PROMPT_SERVED" : "ADDRESS_PROMPT_SERVED",
             appletHint,
           });
 
-          const response = gather(
-            addressPrompt(order),
-            `We did not receive a valid response.
+          const response = isDelivery
+            ? gather(
+              deliveryItemPrompt(order),
+              `We did not receive a valid response.
 
-             If your delivery address is correct, please press 1.
+               If the item you received is correct and in good condition, please press 1.
 
-             If there is an issue with your delivery address, please press 2.`,
-          );
+               If there is any problem with the item, please press 2.`,
+            )
+            : gather(
+              addressPrompt(order),
+              `We did not receive a valid response.
+
+               If your delivery address is correct, please press 1.
+
+               If there is an issue with your delivery address, please press 2.`,
+            );
 
           logEvent({
             fn: "dynamic-greeting",
             level: orderDegraded ? "warning" : "success",
             event: "address_served",
-            message: "Address prompt served",
+            message: isDelivery
+              ? "Delivery item prompt served"
+              : "Address prompt served",
             method: req.method,
             url: req.url,
             params: allParams,
@@ -555,14 +683,16 @@ export default {
         case "done":
         case "goodbye":
         case "confirm": {
-          // Reached only via the address Gather's "correct" branch.
+          // Reached only via the second Gather's "correct" branch — the
+          // address is right (order script) or the delivered item is right
+          // (delivery script).
           logCallStep({
             callSid,
             callerNumber,
             orderId,
             step: "done",
             userInput: digits,
-            status: "ADDRESS_CONFIRMED",
+            status: isDelivery ? "DELIVERY_CONFIRMED" : "ADDRESS_CONFIRMED",
             appletHint,
           });
 
@@ -579,13 +709,17 @@ export default {
             });
           }
 
-          const response = speak(closingPrompt(order, false));
+          const response = speak(
+            isDelivery ? deliveryClosingPrompt(false) : closingPrompt(order, false),
+          );
 
           logEvent({
             fn: "dynamic-greeting",
             level: orderDegraded || !orderId ? "warning" : "success",
             event: "closing_served",
-            message: "Closing message served (address confirmed)",
+            message: isDelivery
+              ? "Closing message served (delivery confirmed)"
+              : "Closing message served (address confirmed)",
             method: req.method,
             url: req.url,
             params: allParams,
@@ -609,7 +743,8 @@ export default {
         // has no "address-issue" step of its own.
 
         // Reached via the welcome Gather's "issue" branch — an order-level
-        // issue; the caller wants to speak to an agent.
+        // issue (the caller wants to speak to an agent), or on the delivery
+        // script, a delivery that never arrived.
         case "issue": {
           logCallStep({
             callSid,
@@ -617,7 +752,7 @@ export default {
             orderId,
             step: "done",
             userInput: digits,
-            status: "ORDER_ISSUE_RAISED",
+            status: isDelivery ? "DELIVERY_NOT_RECEIVED" : "ORDER_ISSUE_RAISED",
             appletHint,
           });
 
@@ -626,17 +761,26 @@ export default {
               orderId,
               callSid,
               callerNumber,
-              outcome: "transferred_to_agent",
+              // A delivery that never arrived is a terminal `issue_raised`
+              // (it moves the recipient there and lands in the issues view);
+              // an order-level "press 2" is a request for a human, which is
+              // what `transferred_to_agent` means. Same node, same digit,
+              // different business fact.
+              outcome: isDelivery ? "issue_raised" : "transferred_to_agent",
             });
           }
 
-          const response = speak(closingPrompt(order, true));
+          const response = speak(
+            isDelivery ? deliveryClosingPrompt(true) : closingPrompt(order, true),
+          );
 
           logEvent({
             fn: "dynamic-greeting",
             level: orderDegraded || !orderId ? "warning" : "success",
             event: "closing_served",
-            message: "Closing message served (order issue)",
+            message: isDelivery
+              ? "Closing message served (delivery not received)"
+              : "Closing message served (order issue)",
             method: req.method,
             url: req.url,
             params: allParams,

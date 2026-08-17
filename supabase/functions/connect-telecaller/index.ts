@@ -3,6 +3,7 @@ import { logCallStep, notifyOrderStatusUpdate } from "../_shared/orders.ts";
 import { logEvent } from "../_shared/logging.ts";
 import { type ConnectContext, resolveConnectConfig } from "./config.ts";
 import { buildConnectResponse } from "../_shared/connect.ts";
+import { parseCustomField } from "../_shared/flow.ts";
 
 const JSON_HEADERS = {
   "Content-Type": "application/json",
@@ -91,7 +92,13 @@ export default {
       const allParams = Object.fromEntries(params.entries());
       const callSid = firstOf(params, "CallSid", "call_sid");
       const callerNumber = firstOf(params, "CallFrom", "From", "caller_number");
-      const orderId = firstOf(params, "CustomField", "custom_field");
+      // Strip the flow suffix — the destination is the order's assigned
+      // telecaller either way, so this endpoint is identical for both
+      // scripts: an address problem and a delivered-item problem both reach
+      // the same person.
+      const { orderId } = parseCustomField(
+        firstOf(params, "CustomField", "custom_field"),
+      );
 
       const ctx: ConnectContext = { orderId, callSid, callerNumber };
       const config = await resolveConnectConfig(ctx);

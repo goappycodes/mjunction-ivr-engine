@@ -11,8 +11,13 @@
 
 export interface ExotelCallRequest {
   phoneNumber: string;
-  /** Travels with the call as CustomField and is echoed back to every applet. */
-  orderId: string;
+  /**
+   * Travels with the call as CustomField and is echoed back to every applet.
+   * Carries the order id *and* which of the two scripts this call is running
+   * (`<unique_id>|oc` / `<unique_id>|dc`) — see `_shared/flow.ts` for why both
+   * scripts share one Exotel app.
+   */
+  customField: string;
   language?: string;
   statusCallbackUrl?: string;
   record?: boolean;
@@ -95,11 +100,13 @@ export async function startExotelCall(
   addParam("From", request.phoneNumber);
   addParam("CallerId", callerId!);
   addParam("Url", flowUrl);
-  // The order id rides along here and Exotel echoes it back as `CustomField` on
-  // every applet request, which is how dynamic-greeting knows which order to
-  // build the prompt from.
-  addParam("CustomField", request.orderId);
-  // Order-confirmation calls are transactional, which is what `trans` declares.
+  // The order id (plus the flow suffix) rides along here and Exotel echoes it
+  // back as `CustomField` on every applet request, which is how
+  // dynamic-greeting knows which order to build the prompt from and which of
+  // the two scripts to read.
+  addParam("CustomField", request.customField);
+  // Both scripts are transactional, which is what `trans` declares — this is
+  // Exotel's own call classification, unrelated to our order/delivery split.
   addParam("CallType", "trans");
   addParam("Record", String(request.record ?? false));
 
