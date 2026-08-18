@@ -394,6 +394,13 @@ EXOTEL_ACCOUNT_SID = "env(EXOTEL_ACCOUNT_SID)"
 EXOTEL_SUBDOMAIN = "env(EXOTEL_SUBDOMAIN)"
 EXOTEL_CALLER_ID = "env(EXOTEL_CALLER_ID)"
 EXOTEL_APP_ID = "env(EXOTEL_APP_ID)"
+# Without these two, notifyPortalCallRecordsRefresh() (_shared/orders.ts)
+# always read them as unset and silently no-opped — mjunction's
+# /api/telephony/webhook was never actually hit, even with correct values
+# sitting in supabase/.env.local, because this block is what actually
+# surfaces them into the edge runtime's process env.
+PORTAL_WEBHOOK_URL = "env(PORTAL_WEBHOOK_URL)"
+IVR_SHARED_SECRET = "env(IVR_SHARED_SECRET)"
 # IMPORTANT when adding to this block: only list variables that are actually
 # set in supabase/.env.local — the CLI aborts `supabase start` with
 # "environment variable X is unset" for any env(X) it cannot resolve, which
