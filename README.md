@@ -260,6 +260,14 @@ and surfaced to the local edge runtime by the `[edge_runtime.secrets]` block in
   `api.exotel.com` for Singapore) or a bare subdomain
 - `EXOTEL_CALLER_ID`
 - `EXOTEL_APP_ID`
+- `PORTAL_WEBHOOK_URL` — mjunction's `/api/telephony/webhook`, POSTed to after
+  a call finalizes or gets a recording attached (see
+  `notifyPortalCallRecordsRefresh` in `_shared/orders.ts`). Missing/unresolved
+  here means the webhook silently never fires, even if the value is correct
+  in `supabase/.env.local` — this block is what actually surfaces it into the
+  edge runtime.
+- `IVR_SHARED_SECRET` — sent as the `x-ivr-shared-secret` header on that
+  request; must match mjunction's own `IVR_SHARED_SECRET` exactly.
 
 `supabase start` has no `--env-file` flag — `env(...)` in `config.toml` is
 resolved from the **process environment**, so the file must be exported into the

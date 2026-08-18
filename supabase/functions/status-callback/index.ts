@@ -105,7 +105,10 @@ export default {
       );
       const exotelStatus = firstOf(params, "Status", "CallStatus", "status");
       const recordingUrl = firstOf(params, "RecordingUrl", "recording_url");
-      const duration = firstOf(params, "Duration", "DialCallDuration", "duration");
+      const durationRaw = firstOf(params, "Duration", "DialCallDuration", "duration");
+      const duration = durationRaw && /^\d+$/.test(durationRaw)
+        ? Number(durationRaw)
+        : null;
 
       if (!callSid) {
         logEvent({
@@ -169,6 +172,7 @@ export default {
           recipientId: attempt.recipientId,
           recordingUrl,
           providerCallRef: callSid,
+          durationSeconds: duration,
         });
       }
 

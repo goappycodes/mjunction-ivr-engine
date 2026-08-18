@@ -500,11 +500,11 @@ export async function getOpenCallAttemptByCallSid(
 }
 
 /**
- * Attach Exotel's recording URL (+ CallSid, for cross-referencing) to a
- * call_attempts row. Separate from `finalizeCallAttempt` because the
- * recording only becomes known once Exotel's StatusCallback fires — which
- * can be well after the Gather flow already finalized the outcome, or can be
- * the only signal at all for a call that never answered.
+ * Attach Exotel's recording URL (+ CallSid + call duration, when Exotel sent
+ * one) to a call_attempts row. Separate from `finalizeCallAttempt` because
+ * the recording only becomes known once Exotel's StatusCallback fires —
+ * which can be well after the Gather flow already finalized the outcome, or
+ * can be the only signal at all for a call that never answered.
  */
 /**
  * Persist Exotel's raw telephony status (queued/ringing/completed/no-answer/
@@ -537,6 +537,7 @@ export async function attachCallRecording(params: {
   recipientId: string;
   recordingUrl: string;
   providerCallRef: string;
+  durationSeconds?: number | null;
 }): Promise<void> {
   const client = db();
   if (!client) return;
@@ -546,6 +547,9 @@ export async function attachCallRecording(params: {
     .update({
       recording_url: params.recordingUrl,
       provider_call_ref: params.providerCallRef,
+      ...(params.durationSeconds != null
+        ? { duration_seconds: params.durationSeconds }
+        : {}),
     })
     .eq("id", params.callAttemptId);
 
@@ -770,7 +774,7 @@ export async function sealDeliveryVoc(callAttemptId: string): Promise<void> {
 
   const { data: attempt, error: attemptError } = await client
     .from("call_attempts")
-    .select("id, recipient_id, campaign_id, call_type, outcome, language, dtmf_response, recording_url")
+    .select("id, recipient_id, campaign_id, call_type, outcome, language, dtmf_response, recording_url, duration_seconds")
     .eq("id", callAttemptId)
     .maybeSingle();
 
@@ -800,6 +804,7 @@ export async function sealDeliveryVoc(callAttemptId: string): Promise<void> {
     language: attempt.language,
     dtmf_outcome: attempt.dtmf_response,
     storage_path: attempt.recording_url,
+    duration_seconds: attempt.duration_seconds,
   });
 
   if (error) {
