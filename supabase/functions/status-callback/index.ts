@@ -48,22 +48,33 @@ async function readParams(req: Request, url: URL): Promise<URLSearchParams> {
   const params = new URLSearchParams(url.searchParams);
 
   if (req.method === "POST" || req.method === "PUT") {
-    const raw = await req.text();
-    if (raw) {
-      const contentType = req.headers.get("content-type") ?? "";
-      try {
-        if (contentType.includes("application/json")) {
-          for (const [k, v] of Object.entries(JSON.parse(raw))) {
-            if (!params.has(k)) params.append(k, String(v));
-          }
-        } else {
-          for (const [k, v] of new URLSearchParams(raw)) {
-            if (!params.has(k)) params.append(k, v);
+    const contentType = req.headers.get("content-type") ?? "";
+    try {
+      if (contentType.includes("multipart/form-data")) {
+        // Exotel's StatusCallback is sometimes delivered as multipart, not
+        // form-urlencoded — req.text() + URLSearchParams can't parse that
+        // (it silently produces one garbage key from the raw boundary text,
+        // dropping CallSid entirely), so this needs the dedicated parser.
+        const form = await req.formData();
+        for (const [k, v] of form.entries()) {
+          if (!params.has(k) && typeof v === "string") params.append(k, v);
+        }
+      } else {
+        const raw = await req.text();
+        if (raw) {
+          if (contentType.includes("application/json")) {
+            for (const [k, v] of Object.entries(JSON.parse(raw))) {
+              if (!params.has(k)) params.append(k, String(v));
+            }
+          } else {
+            for (const [k, v] of new URLSearchParams(raw)) {
+              if (!params.has(k)) params.append(k, v);
+            }
           }
         }
-      } catch (_e) {
-        console.warn("[status-callback] unparseable body ignored");
       }
+    } catch (_e) {
+      console.warn("[status-callback] unparseable body ignored");
     }
   }
 
