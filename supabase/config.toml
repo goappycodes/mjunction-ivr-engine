@@ -471,3 +471,12 @@ enabled = true
 verify_jwt = false
 import_map = "./functions/status-callback/deno.json"
 entrypoint = "./functions/status-callback/index.ts"
+
+[functions.reconcile-calls]
+enabled = true
+# Runs on its own Deno.cron schedule once deployed; the HTTP entrypoint is
+# only for manual/test triggering or an external scheduler, guarded by
+# x-ivr-shared-secret same as ivr-engine (no JWT, no end-user session).
+verify_jwt = false
+import_map = "./functions/reconcile-calls/deno.json"
+entrypoint = "./functions/reconcile-calls/index.ts"

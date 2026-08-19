@@ -9,8 +9,13 @@
  * viewer alone, without needing to reproduce the call by hand.
  *
  * Routed to console.error/warn/log by level so Supabase's log-level filter
- * (and any downstream log pipeline) can filter by severity.
+ * (and any downstream log pipeline) can filter by severity. Also persisted
+ * to `ivr_request_log` (fire-and-forget, best-effort) so the same payload is
+ * queryable with SQL rather than only readable from the ephemeral function
+ * log viewer — every call site already passes `params`/`body`, so this is a
+ * pure addition, not a new thing callers have to remember to do.
  */
+import { db, waitUntil } from "./db.ts";
 
 export type LogLevel = "success" | "warning" | "error";
 
@@ -22,9 +27,15 @@ export interface LogFields {
   event: string;
   /** One-line human summary. */
   message: string;
+  /**
+   * "inbound" (default) — a request this function received (from Exotel or
+   * another caller). "outbound" — a request this function sent (e.g.
+   * ivr-engine calling Exotel's Calls/connect, or the Call Details lookup).
+   */
+  direction?: "inbound" | "outbound";
   method?: string;
   url?: string;
-  /** Every param Exotel (or the caller) sent, query + body merged. */
+  /** Every param Exotel (or the caller) sent, query + body merged — or, for an outbound log, the payload we sent. */
   params?: Record<string, unknown>;
   /** HTTP status this request is being answered with. */
   status?: number;
@@ -43,4 +54,38 @@ export function logEvent(fields: LogFields): void {
   if (fields.level === "error") console.error(line);
   else if (fields.level === "warning") console.warn(line);
   else console.log(line);
+
+  persistRequestLog(fields);
+}
+
+function persistRequestLog(fields: LogFields): void {
+  const client = db();
+  if (!client) return;
+
+  const payload = fields.params || fields.body !== undefined
+    ? {
+      ...(fields.params ? { params: fields.params } : {}),
+      ...(fields.body !== undefined ? { response: fields.body } : {}),
+    }
+    : null;
+
+  const task = client.from("ivr_request_log").insert({
+    fn: fields.fn,
+    direction: fields.direction ?? "inbound",
+    event: fields.event,
+    level: fields.level,
+    method: fields.method ?? null,
+    url: fields.url ?? null,
+    status: fields.status ?? null,
+    call_sid: fields.callSid ?? null,
+    order_id: fields.orderId ?? null,
+    message: fields.message,
+    payload,
+    error: fields.error ?? null,
+    duration_ms: fields.durationMs ?? null,
+  }).then(({ error }: { error: { message: string } | null }) => {
+    if (error) console.error("[persistRequestLog] insert failed:", error.message);
+  });
+
+  waitUntil(task as Promise<unknown>);
 }

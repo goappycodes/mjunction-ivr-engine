@@ -16,7 +16,6 @@
  * misconfigured Exotel flow — separate from the business-level record that
  * lives in `call_attempts`.
  */
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import {
   canTransition,
   type CallOutcome,
@@ -24,28 +23,9 @@ import {
   orderConfirmationStatusFor,
   type RecipientStatus,
 } from "./status.ts";
+import { db, functionsUrl, serviceRoleKey, waitUntil } from "./db.ts";
 
-const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "http://127.0.0.1:54321";
-// Server-to-server: no end-user session exists, so use the service-role key.
-// The anon key is subject to RLS and every read here would return zero rows.
-const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ??
-  Deno.env.get("SUPABASE_ANON_KEY") ?? "";
-
-// createClient throws on an empty key. At module scope that would stop the
-// worker from booting, so it is built lazily and a missing key degrades to
-// "no database" rather than a dropped call.
-let cached: SupabaseClient | null = null;
-export function db(): SupabaseClient | null {
-  if (!supabaseKey) return null;
-  if (!cached) cached = createClient(supabaseUrl, supabaseKey);
-  return cached;
-}
-
-/** Build a same-project functions URL, e.g. for a default StatusCallback. */
-export function functionsUrl(name: string): string {
-  return `${supabaseUrl.replace(/\/$/, "")}/functions/v1/${name}`;
-}
-
+export { db, functionsUrl };
 export type { CallOutcome, RecipientStatus };
 
 /**
@@ -293,14 +273,6 @@ export function logCallStep(entry: CallLogEntry): void {
   waitUntil(task);
 }
 
-function waitUntil(task: Promise<unknown>): void {
-  const runtime = (globalThis as {
-    EdgeRuntime?: { waitUntil?: (p: Promise<unknown>) => void };
-  }).EdgeRuntime;
-
-  if (runtime?.waitUntil) runtime.waitUntil(task);
-}
-
 /**
  * The digit pressed on an earlier Gather menu arrives with the *next*
  * applet's request (Exotel's echo-on-next-request behaviour — see the
@@ -497,6 +469,111 @@ export async function getOpenCallAttemptByCallSid(
     attemptNumber: data.attempt_number as number,
     outcome: (data.outcome as CallOutcome | null) ?? null,
   };
+}
+
+export interface StaleCallAttempt {
+  id: string;
+  callSid: string;
+  recipientId: string;
+  campaignId: string;
+  callType: CallType;
+  attemptNumber: number;
+}
+
+/**
+ * Calls whose terminal status likely never arrived — the case Exotel's own
+ * webhook docs call out ("StatusCallback delivery may be delayed or fail...
+ * implement fallback logic using the Call Details API"). `reconcile-calls`
+ * polls this list and asks Exotel directly instead of waiting on the
+ * webhook.
+ *
+ * "Likely never arrived" is `outcome is null` (nothing finalized it) AND
+ * `provider_status` is still a non-terminal value (or was never set at all)
+ * — a call that *did* get a real terminal status via status-callback but
+ * stayed outcome-less on purpose (e.g. the caller hung up mid-menu, see
+ * `terminalStatusOutcome`) is a legitimate permanent state, not a missed
+ * webhook, and re-polling it forever would just waste Exotel API calls.
+ *
+ * Bounded on both ends of `started_at`: `olderThanMinutes` gives Exotel's own
+ * webhook a fair chance to arrive first, `newerThanHours` stops a call from
+ * being retried forever if it can never resolve (e.g. Exotel itself lost the
+ * record).
+ */
+export async function getStaleOpenCallAttempts(params: {
+  olderThanMinutes: number;
+  newerThanHours: number;
+  limit?: number;
+}): Promise<StaleCallAttempt[]> {
+  const client = db();
+  if (!client) return [];
+
+  const now = Date.now();
+  const olderThan = new Date(now - params.olderThanMinutes * 60_000)
+    .toISOString();
+  const newerThan = new Date(now - params.newerThanHours * 3_600_000)
+    .toISOString();
+
+  const { data, error } = await client
+    .from("call_attempts")
+    .select("id, recipient_id, campaign_id, call_type, attempt_number")
+    .is("outcome", null)
+    .lt("started_at", olderThan)
+    .gt("started_at", newerThan)
+    .or(
+      "provider_status.is.null,provider_status.eq.queued,provider_status.eq.ringing,provider_status.eq.in-progress",
+    )
+    .order("started_at", { ascending: true })
+    .limit(params.limit ?? 50);
+
+  if (error) {
+    console.error(
+      "[getStaleOpenCallAttempts] call_attempts query failed:",
+      error.code,
+      error.message,
+    );
+    return [];
+  }
+  if (!data?.length) return [];
+
+  const ids = data.map((row) => row.id as string);
+  const { data: logRows, error: logError } = await client
+    .from("ivr_logs")
+    .select("call_sid, call_attempt_id")
+    .in("call_attempt_id", ids);
+
+  if (logError) {
+    console.error(
+      "[getStaleOpenCallAttempts] ivr_logs lookup failed:",
+      logError.code,
+      logError.message,
+    );
+    return [];
+  }
+
+  const callSidByAttemptId = new Map<string, string>();
+  for (const row of logRows ?? []) {
+    const attemptId = row.call_attempt_id as string | null;
+    const callSid = row.call_sid as string | null;
+    if (attemptId && callSid) callSidByAttemptId.set(attemptId, callSid);
+  }
+
+  const result: StaleCallAttempt[] = [];
+  for (const row of data) {
+    const callSid = callSidByAttemptId.get(row.id as string);
+    // No call_sid on record at all — nothing for the Call Details API to
+    // look up yet (ivr-engine writes it synchronously at dial time, so this
+    // should only ever be a brief race, not a stuck state).
+    if (!callSid) continue;
+    result.push({
+      id: row.id as string,
+      callSid,
+      recipientId: row.recipient_id as string,
+      campaignId: row.campaign_id as string,
+      callType: row.call_type as CallType,
+      attemptNumber: row.attempt_number as number,
+    });
+  }
+  return result;
 }
 
 /**
@@ -908,7 +985,7 @@ export function notifyOrderStatusUpdate(entry: OrderStatusNotification): void {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...(supabaseKey ? { Authorization: `Bearer ${supabaseKey}` } : {}),
+      ...(serviceRoleKey() ? { Authorization: `Bearer ${serviceRoleKey()}` } : {}),
     },
     body: JSON.stringify(entry),
   })

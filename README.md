@@ -31,6 +31,13 @@ mock call — see "How the order id flows through the call" below.
 - `index.ts` - captures the recording URL and finalizes calls that never
   reached a menu (no-answer/busy/failed)
 
+`supabase/functions/reconcile-calls/` — fallback for a missed/delayed
+`StatusCallback`, per Exotel's own webhook guidance
+- `index.ts` - every 5 minutes (self-scheduled via `Deno.cron`, plus an
+  HTTP entrypoint for manual/test triggering), polls Exotel's Call Details
+  API for any `call_attempts` row that looks stuck and finalizes it the same
+  way `status-callback` would have
+
 `supabase/functions/_shared/`
 - `orders.ts` - recipient lookups, call_attempts lifecycle, call logging,
   VOC sealing, timeout guard (used by all)
@@ -38,7 +45,15 @@ mock call — see "How the order id flows through the call" below.
   mjunction's `src/lib/domain/status.ts`
 - `flow.ts` - which of the two scripts (order / delivery confirmation) a call
   is running, and how that rides along in Exotel's `CustomField`
-- `logging.ts` - structured per-request console logging
+- `exotel.ts` - Exotel Call Details API (`GET Calls/{Sid}.json`), used by
+  `reconcile-calls`
+- `logging.ts` - structured per-request logging: one line to the console
+  (Supabase's log viewer) and one row into `ivr_request_log`, for every
+  inbound request every function receives and every outbound request this
+  project sends to Exotel (`Calls/connect`, Call Details)
+- `db.ts` - the shared Supabase client + `waitUntil`/`functionsUrl` helpers,
+  factored out of `orders.ts` so `logging.ts` doesn't have to depend on the
+  whole recipient/call_attempts module just for a DB handle
 
 ## Two scripts, one Exotel app
 
@@ -223,8 +238,10 @@ Eligible statuses per `callType`:
 `recipients`, `call_attempts` and `recipient_events` — **mjunction's** tables,
 created by *that* repo's migrations (`0001_init.sql` etc.), not this one's.
 This repo's own migrations only cover `ivr_logs` / `ivr_call_events`
-(`0004_ivr_runtime.sql`, `0005_ivr_call_events.sql`) and the link between them
-(`0006_ivr_logs_call_attempt_link.sql`, adding `ivr_logs.call_attempt_id`).
+(`0004_ivr_runtime.sql`, `0005_ivr_call_events.sql`), the link between them
+(`0006_ivr_logs_call_attempt_link.sql`, adding `ivr_logs.call_attempt_id`), and
+`ivr_request_log` (`0008_ivr_request_log.sql`) — the full request/response
+payload log every `logEvent()` call writes to, in addition to the console.
 
 **This means `supabase db reset` from this repo alone is no longer enough for
 a fresh environment.** mjunction's migrations must be applied to the same
@@ -400,6 +417,40 @@ for the same call:
    A call that *did* complete the Gather flow already has a real outcome by
    the time this fires, so it is never overwritten with a generic one.
 
+### Fallback: `reconcile-calls`
+
+`status-callback` is push-based — it only runs if Exotel's webhook actually
+reaches it. Exotel's own documentation is explicit that this isn't
+guaranteed:
+
+> StatusCallback delivery may be delayed or fail due to network issues,
+> server problems, or webhook downtime. Implement fallback logic using the
+> Call Details API to ensure you capture all call data.
+
+`reconcile-calls` is that fallback. Every 5 minutes (self-scheduled via
+`Deno.cron`, so no external cron needs to be wired up once this is deployed)
+it:
+
+1. Finds `call_attempts` rows that look stuck — no `outcome`, and
+   `provider_status` still `queued` / `ringing` / `in-progress` / unset,
+   started more than 10 minutes ago but less than 24 hours ago (see
+   `getStaleOpenCallAttempts` in `_shared/orders.ts` for the exact
+   definition — a call that legitimately has no outcome forever, e.g. the
+   caller hung up mid-menu, already has a real terminal `provider_status`
+   from `status-callback` and is correctly excluded).
+2. Calls Exotel's Call Details API (`GET Calls/{Sid}.json`) directly for
+   each one — `_shared/exotel.ts`.
+3. Runs the exact same attach-recording / finalize-outcome / seal-VOC logic
+   `status-callback` runs, so a call is finalized identically whether the
+   webhook arrived or this fallback caught it. Safe to run concurrently with
+   `status-callback` — every write here is the same idempotent operation
+   that function already relies on.
+
+The HTTP entrypoint (`POST`, `x-ivr-shared-secret` header, same as
+`ivr-engine`) exists for manual testing and as an escape hatch if you'd
+rather trigger this from an external scheduler (e.g. `pg_cron` + `pg_net`,
+or a scheduler outside Supabase) instead of relying on `Deno.cron`.
+
 ## How to Deploy
 
 ```bash
@@ -415,6 +466,7 @@ supabase functions deploy ivr-engine --use-api
 supabase functions deploy dynamic-greeting --use-api
 supabase functions deploy update-order-status --use-api
 supabase functions deploy status-callback --use-api
+supabase functions deploy reconcile-calls --use-api
 ```
 
 ## Integration notes
