@@ -117,6 +117,7 @@ export default {
       const exotelStatus = firstOf(params, "Status", "CallStatus", "status");
       const recordingUrl = firstOf(params, "RecordingUrl", "recording_url");
       const durationRaw = firstOf(params, "Duration", "DialCallDuration", "duration");
+      // Exotel StatusCallback sends Duration in seconds (same as Call Details API).
       const duration = durationRaw && /^\d+$/.test(durationRaw)
         ? Number(durationRaw)
         : null;
@@ -188,12 +189,13 @@ export default {
         durationSeconds: duration,
       });
 
-      // The other half of the VOC-sealing race: a delivery call that was
-      // already confirmed by the Gather flow has been waiting for exactly
-      // this recording URL. No-op for every other call. Idempotent, so the
-      // finalize path below (and a repeat delivery of this callback) can both
-      // call it safely.
-      if (recordingUrl && attempt.callType === "delivery_confirmation") {
+      // Attempt VOC sealing for every delivery_confirmation callback —
+      // sealDeliveryVoc reads recording_url from the DB (not from the
+      // webhook params), so it succeeds even when this callback carries no
+      // RecordingUrl, as long as a previous operation already persisted one.
+      // The function is idempotent: it no-ops if already sealed or if the DB
+      // row still has no recording_url.
+      if (attempt.callType === "delivery_confirmation") {
         await sealDeliveryVoc(attempt.id);
       }
 
