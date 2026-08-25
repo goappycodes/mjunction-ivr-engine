@@ -177,15 +177,16 @@ export default {
         await updateProviderStatus(attempt.id, exotelStatus);
       }
 
-      if (recordingUrl) {
-        await attachCallRecording({
-          callAttemptId: attempt.id,
-          recipientId: attempt.recipientId,
-          recordingUrl,
-          providerCallRef: callSid,
-          durationSeconds: duration,
-        });
-      }
+      // Always persist callSid and duration regardless of whether a recording
+      // was captured — no-answer/busy/failed calls carry no RecordingUrl but
+      // still produce a meaningful callSid and duration that belong on the row.
+      await attachCallRecording({
+        callAttemptId: attempt.id,
+        recipientId: attempt.recipientId,
+        recordingUrl: recordingUrl || null,
+        providerCallRef: callSid,
+        durationSeconds: duration,
+      });
 
       // The other half of the VOC-sealing race: a delivery call that was
       // already confirmed by the Gather flow has been waiting for exactly

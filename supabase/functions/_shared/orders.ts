@@ -612,7 +612,7 @@ export async function updateProviderStatus(
 export async function attachCallRecording(params: {
   callAttemptId: string;
   recipientId: string;
-  recordingUrl: string;
+  recordingUrl: string | null;
   providerCallRef: string;
   durationSeconds?: number | null;
 }): Promise<void> {
@@ -622,8 +622,10 @@ export async function attachCallRecording(params: {
   const { error } = await client
     .from("call_attempts")
     .update({
-      recording_url: params.recordingUrl,
       provider_call_ref: params.providerCallRef,
+      ...(params.recordingUrl != null
+        ? { recording_url: params.recordingUrl }
+        : {}),
       ...(params.durationSeconds != null
         ? { duration_seconds: params.durationSeconds }
         : {}),
