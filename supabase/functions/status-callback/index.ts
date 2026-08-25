@@ -117,9 +117,9 @@ export default {
       const exotelStatus = firstOf(params, "Status", "CallStatus", "status");
       const recordingUrl = firstOf(params, "RecordingUrl", "recording_url");
       const durationRaw = firstOf(params, "Duration", "DialCallDuration", "duration");
-      // Exotel sends duration in milliseconds; store as whole seconds.
+      // Exotel StatusCallback sends Duration in seconds (same as Call Details API).
       const duration = durationRaw && /^\d+$/.test(durationRaw)
-        ? Math.round(Number(durationRaw) / 1000)
+        ? Number(durationRaw)
         : null;
 
       if (!callSid) {
