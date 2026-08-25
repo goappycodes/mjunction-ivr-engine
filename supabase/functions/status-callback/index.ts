@@ -107,6 +107,22 @@ export default {
     try {
       const params = await readParams(req, url);
       const allParams = Object.fromEntries(params.entries());
+
+      // Log every raw param Exotel sends before any processing — this is the
+      // ground truth for debugging missing fields (RecordingUrl, Duration, etc.).
+      logEvent({
+        fn: "status-callback",
+        level: "info",
+        event: "raw_params_received",
+        message: `StatusCallback received ${Object.keys(allParams).length} params`,
+        method: req.method,
+        contentType: req.headers.get("content-type") ?? "(none)",
+        params: allParams,
+        fields_present: Object.keys(allParams),
+        has_recording_url: "RecordingUrl" in allParams || "recording_url" in allParams,
+        has_duration: "Duration" in allParams || "DialCallDuration" in allParams || "duration" in allParams,
+      });
+
       const callSid = firstOf(params, "CallSid", "call_sid");
       // CustomField carries the flow suffix as well as the order id; only the
       // id is wanted here (the call's own call_attempts row is the
