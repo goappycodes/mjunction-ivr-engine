@@ -9,6 +9,8 @@
  *           CustomField, Record
  */
 
+import { logEvent } from "../_shared/logging.ts";
+
 export interface ExotelCallRequest {
   phoneNumber: string;
   /**
@@ -93,8 +95,13 @@ export async function startExotelCall(
     `http://my.exotel.com/${accountSid}/exoml/start_voice/${appId}`;
 
   const bodyParts: string[] = [];
+  // Kept alongside bodyParts (rather than parsed back out of it) so the
+  // outbound payload can be logged as a real object, not a re-decoded
+  // querystring.
+  const bodyFields: Record<string, string> = {};
   const addParam = (key: string, value: string) => {
     bodyParts.push(`${key}=${encodeURIComponent(value)}`);
+    bodyFields[key] = value;
   };
 
   addParam("From", request.phoneNumber);
@@ -138,10 +145,38 @@ export async function startExotelCall(
   try {
     parsedJson = JSON.parse(responseText);
   } catch (_e) {
+    logEvent({
+      fn: "ivr-engine",
+      level: "error",
+      event: "exotel_connect_response_unparseable",
+      message: `Exotel connect response unparseable (HTTP ${response.status})`,
+      direction: "outbound",
+      method: "POST",
+      url: endpoint,
+      status: response.status,
+      params: bodyFields,
+      body: responseText.slice(0, 500),
+    });
     throw new Error(
       `Failed to parse Exotel API response (HTTP ${response.status}): ${responseText}`,
     );
   }
+
+  // Logged once here, regardless of response.ok, so the outbound payload is
+  // captured for both a successful call placement and a rejected one — the
+  // error-handling below still runs unchanged after this.
+  logEvent({
+    fn: "ivr-engine",
+    level: response.ok ? "success" : "error",
+    event: "exotel_connect_request",
+    message: `Calls/connect -> HTTP ${response.status}`,
+    direction: "outbound",
+    method: "POST",
+    url: endpoint,
+    status: response.status,
+    params: bodyFields,
+    body: parsedJson,
+  });
 
   if (!response.ok) {
     const restException = parsedJson?.RestException as
