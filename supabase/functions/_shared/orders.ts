@@ -467,6 +467,72 @@ export async function getOpenCallAttemptByCallSid(
   };
 }
 
+/**
+ * How long a still-open call_attempts row (no outcome yet) counts as
+ * "genuinely still active" for `hasActiveCallForPhone`. Kept well short of
+ * `getStaleOpenCallAttempts`'s 10-minute floor: an IVR call itself only ever
+ * runs a couple of minutes, so anything older than this is far more likely a
+ * missed StatusCallback (which reconcile-calls cleans up on its own slower
+ * schedule) than a call still ringing/connected, and should not go on
+ * blocking new calls to the same number indefinitely.
+ */
+const ACTIVE_CALL_WINDOW_MINUTES = 15;
+
+/**
+ * True if `phoneNumber` already has a call in flight — open (no outcome
+ * yet), in a non-terminal provider state, started recently enough to still
+ * plausibly be ringing or connected. Checked by phone number rather than
+ * recipient_id: a phone number can belong to more than one recipient row
+ * (import no longer dedupes on phone — see mjunction's commitImport), and
+ * Exotel can only ever have one real active call to a given number at a
+ * time regardless of which order it's for.
+ *
+ * Fails open (returns false) on any lookup error or timeout — a DB hiccup
+ * must never block a legitimate call, matching this module's posture
+ * everywhere else (see `withTimeout`, `resolveOrder` in dynamic-greeting).
+ */
+export async function hasActiveCallForPhone(phoneNumber: string): Promise<boolean> {
+  const client = db();
+  if (!client || !phoneNumber) return false;
+
+  return await withTimeout(
+    (async () => {
+      const { data: recipientRows, error: recError } = await client
+        .from("recipients")
+        .select("id")
+        .eq("contact_no_e164", phoneNumber);
+
+      if (recError) {
+        console.error("[hasActiveCallForPhone] recipients lookup failed:", recError.code, recError.message);
+        return false;
+      }
+      const recipientIds = (recipientRows ?? []).map((r) => r.id as string);
+      if (!recipientIds.length) return false;
+
+      const cutoff = new Date(Date.now() - ACTIVE_CALL_WINDOW_MINUTES * 60_000)
+        .toISOString();
+
+      const { count, error } = await client
+        .from("call_attempts")
+        .select("id", { count: "exact", head: true })
+        .in("recipient_id", recipientIds)
+        .is("outcome", null)
+        .gt("started_at", cutoff)
+        .or(
+          "provider_status.is.null,provider_status.eq.queued,provider_status.eq.ringing,provider_status.eq.in-progress",
+        );
+
+      if (error) {
+        console.error("[hasActiveCallForPhone] call_attempts lookup failed:", error.code, error.message);
+        return false;
+      }
+      return (count ?? 0) > 0;
+    })(),
+    false,
+    "hasActiveCallForPhone",
+  );
+}
+
 export interface StaleCallAttempt {
   id: string;
   callSid: string;

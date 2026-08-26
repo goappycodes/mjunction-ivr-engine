@@ -2,6 +2,7 @@ import "@supabase/functions-js/edge-runtime.d.ts";
 import { startExotelCall, type ExotelCallRequest } from "./exotel.ts";
 import {
   functionsUrl,
+  hasActiveCallForPhone,
   lookupOrderById,
   startCallAttempt,
   transitionRecipientStatus,
@@ -225,6 +226,29 @@ export default {
             error:
               `Order ${orderId} is in status "${order.status}", which is not eligible for a ${rules.label} call`,
             hint: `Eligible statuses: ${rules.callable.join(", ")}`,
+          },
+          409,
+        );
+      }
+
+      // Refuse to place a second call to a number that's already mid-call.
+      // Phone numbers are no longer unique per recipient (mjunction's import
+      // stopped deduping on phone), so this is checked by phone rather than
+      // by this one order/recipient — Exotel can only ever have one real
+      // active call to a given number regardless of which order it's for.
+      if (await hasActiveCallForPhone(phoneNumber)) {
+        log(
+          "warning",
+          "phone_already_in_call",
+          `Refused: ${phoneNumber} already has a call in progress`,
+          409,
+          { orderId, callerNumber: phoneNumber },
+        );
+        return json(
+          {
+            success: false,
+            error: `${phoneNumber} already has a call in progress`,
+            hint: "Wait for the current call to finish before placing another to the same number",
           },
           409,
         );
