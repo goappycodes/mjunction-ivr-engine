@@ -17,7 +17,7 @@
  */
 import { db, waitUntil } from "./db.ts";
 
-export type LogLevel = "success" | "warning" | "error";
+export type LogLevel = "success" | "info" | "warning" | "error";
 
 export interface LogFields {
   /** Function emitting the log, e.g. "dynamic-greeting". */
@@ -47,6 +47,13 @@ export interface LogFields {
   step?: string;
   durationMs?: number;
   error?: string;
+  /**
+   * Ad-hoc diagnostic fields alongside `params`/`body` — e.g. a quick-scan
+   * summary (content type, which expected keys are present) so a payload can
+   * be triaged from the log line without expanding the full params object.
+   * Persisted into the DB row's `payload.meta` alongside params/response.
+   */
+  meta?: Record<string, unknown>;
 }
 
 export function logEvent(fields: LogFields): void {
@@ -62,10 +69,11 @@ function persistRequestLog(fields: LogFields): void {
   const client = db();
   if (!client) return;
 
-  const payload = fields.params || fields.body !== undefined
+  const payload = fields.params || fields.body !== undefined || fields.meta
     ? {
       ...(fields.params ? { params: fields.params } : {}),
       ...(fields.body !== undefined ? { response: fields.body } : {}),
+      ...(fields.meta ? { meta: fields.meta } : {}),
     }
     : null;
 
