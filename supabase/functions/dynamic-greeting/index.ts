@@ -278,9 +278,7 @@ async function resolveOrder(
 
 function welcomePrompt(order: OrderRecord | null): string {
   if (!order) {
-    return `Welcome to mjunction.
-
-      This is an automated call regarding your recent order.
+    return `This is an automated call regarding your recent order.
 
       To confirm your order, please press 1.
 
@@ -290,11 +288,10 @@ function welcomePrompt(order: OrderRecord | null): string {
   const greeting = order.customer_name
     ? `Hello ${order.customer_name}.`
     : "Hello.";
+  const from = order.company_name ? ` from ${order.company_name}` : "";
   const item = order.product_name ? ` for ${order.product_name}` : "";
 
-  return `${greeting} Welcome to mjunction.
-
-    This is an automated call regarding your order
+  return `${greeting} This is an automated call${from} regarding your order
     ${spellReference(order.order_id)}${item}.
 
     To confirm your order, please press 1.
@@ -327,8 +324,6 @@ function orderConfirmedPrompt(): string {
 
     Your order has been successfully confirmed and will be processed according to the delivery schedule.
 
-    Thank you for choosing mjunction.
-
     Goodbye.`;
 }
 
@@ -357,9 +352,7 @@ function escalationPrompt(): string {
  */
 function deliveryWelcomePrompt(order: OrderRecord | null): string {
   if (!order) {
-    return `Welcome to mjunction.
-
-      This is an automated call regarding the delivery of your recent order.
+    return `This is an automated call regarding the delivery of your recent order.
 
       If you have received your delivery, please press 1.
 
@@ -369,11 +362,10 @@ function deliveryWelcomePrompt(order: OrderRecord | null): string {
   const greeting = order.customer_name
     ? `Hello ${order.customer_name}.`
     : "Hello.";
+  const from = order.company_name ? ` from ${order.company_name}` : "";
   const item = order.product_name ? ` for ${order.product_name}` : "";
 
-  return `${greeting} Welcome to mjunction.
-
-    This is an automated call regarding the delivery of your order
+  return `${greeting} This is an automated call${from} regarding the delivery of your order
     ${spellReference(order.order_id)}${item}.
 
     If you have received your delivery, please press 1.
@@ -409,8 +401,6 @@ function deliveryConfirmedPrompt(): string {
   return `Thank you for confirming your delivery.
 
     Your delivery has been successfully confirmed and this order is now complete.
-
-    Thank you for choosing mjunction.
 
     Goodbye.`;
 }

@@ -169,6 +169,39 @@ export default {
     }
 
     try {
+      // Debug mode: POST with { "callSid": "xxx" } to inspect what Exotel's
+      // Call Details API returns for a specific call without touching the DB.
+      // Useful for diagnosing missing RecordingUrl on already-finalized calls
+      // that reconcile() skips (it only processes outcome IS NULL rows).
+      let body: Record<string, unknown> = {};
+      try {
+        const text = await req.text();
+        if (text) body = JSON.parse(text);
+      } catch (_) { /* empty body is fine */ }
+
+      if (typeof body.callSid === "string" && body.callSid.trim()) {
+        const callSid = body.callSid.trim();
+        const details = await getCallDetails(callSid);
+        return Response.json({
+          success: true,
+          debug: true,
+          callSid,
+          exotel: details
+            ? {
+                status: details.status,
+                recordingUrl: details.recordingUrl,
+                durationSeconds: details.durationSeconds,
+                hasRecording: !!details.recordingUrl,
+              }
+            : null,
+          note: details
+            ? details.recordingUrl
+              ? "Exotel HAS a recording — needs to be backfilled into DB"
+              : "Exotel has NO recording for this call — Record param may not be working"
+            : "Exotel Call Details API returned null — check credentials or invalid CallSid",
+        }, { status: 200, headers: JSON_HEADERS });
+      }
+
       const result = await reconcile();
       return Response.json({ success: true, ...result }, {
         status: 200,

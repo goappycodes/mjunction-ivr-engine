@@ -43,7 +43,7 @@ export interface OrderRecord {
   status: RecipientStatus;
   /** Internal — `recipients.id`, needed for every write below. */
   recipient_id: string;
-  campaign_id: string;
+  company_name: string | null;
   /** E.164 — the telecaller who owns this order; shown in mjunction, not dialled by the IVR. */
   telecaller_phone: string | null;
 }
@@ -56,7 +56,7 @@ const RECIPIENT_COLUMNS = [
   "product_name",
   "status",
   "recipient_id:id",
-  "campaign_id",
+  "company_name",
   "telecaller_phone",
 ].join(", ");
 
@@ -373,7 +373,6 @@ export interface StartedCallAttempt {
  */
 export async function startCallAttempt(params: {
   recipientId: string;
-  campaignId: string;
   callType: CallType;
 }): Promise<StartedCallAttempt | null> {
   const client = db();
@@ -394,7 +393,6 @@ export async function startCallAttempt(params: {
     .from("call_attempts")
     .insert({
       recipient_id: params.recipientId,
-      campaign_id: params.campaignId,
       call_type: params.callType,
       attempt_number: attemptNumber,
       provider: "exotel",
@@ -416,7 +414,6 @@ export interface OpenCallAttempt {
   /** call_attempts.id — a uuid. */
   id: string;
   recipientId: string;
-  campaignId: string;
   callType: CallType;
   attemptNumber: number;
   /** Null until finalizeCallAttempt has run — callers use this to tell "still open" from "already finalized". */
@@ -451,7 +448,7 @@ export async function getOpenCallAttemptByCallSid(
 
   const { data, error } = await client
     .from("call_attempts")
-    .select("id, recipient_id, campaign_id, call_type, attempt_number, outcome")
+    .select("id, recipient_id, call_type, attempt_number, outcome")
     .eq("id", logRow.call_attempt_id)
     .maybeSingle();
 
@@ -464,7 +461,6 @@ export async function getOpenCallAttemptByCallSid(
   return {
     id: data.id as string,
     recipientId: data.recipient_id as string,
-    campaignId: data.campaign_id as string,
     callType: data.call_type as CallType,
     attemptNumber: data.attempt_number as number,
     outcome: (data.outcome as CallOutcome | null) ?? null,
@@ -475,7 +471,6 @@ export interface StaleCallAttempt {
   id: string;
   callSid: string;
   recipientId: string;
-  campaignId: string;
   callType: CallType;
   attemptNumber: number;
 }
@@ -515,7 +510,7 @@ export async function getStaleOpenCallAttempts(params: {
 
   const { data, error } = await client
     .from("call_attempts")
-    .select("id, recipient_id, campaign_id, call_type, attempt_number")
+    .select("id, recipient_id, call_type, attempt_number")
     .is("outcome", null)
     .lt("started_at", olderThan)
     .gt("started_at", newerThan)
@@ -568,7 +563,6 @@ export async function getStaleOpenCallAttempts(params: {
       id: row.id as string,
       callSid,
       recipientId: row.recipient_id as string,
-      campaignId: row.campaign_id as string,
       callType: row.call_type as CallType,
       attemptNumber: row.attempt_number as number,
     });
@@ -853,7 +847,7 @@ export async function sealDeliveryVoc(callAttemptId: string): Promise<void> {
 
   const { data: attempt, error: attemptError } = await client
     .from("call_attempts")
-    .select("id, recipient_id, campaign_id, call_type, outcome, language, dtmf_response, recording_url, duration_seconds")
+    .select("id, recipient_id, call_type, outcome, language, dtmf_response, recording_url, duration_seconds")
     .eq("id", callAttemptId)
     .maybeSingle();
 
@@ -875,7 +869,6 @@ export async function sealDeliveryVoc(callAttemptId: string): Promise<void> {
   const { error } = await client.from("voc_recordings").insert({
     sealed_voc_id: sealed,
     recipient_id: attempt.recipient_id,
-    campaign_id: attempt.campaign_id,
     call_attempt_id: attempt.id,
     call_type: "delivery_confirmation",
     product_name: recipient?.product_name ?? null,

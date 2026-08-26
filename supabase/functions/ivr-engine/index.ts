@@ -251,7 +251,6 @@ export default {
       // *during* the call instead of only once at the very end.
       const attempt = await startCallAttempt({
         recipientId: order.recipient_id,
-        campaignId: order.campaign_id,
         callType,
       });
 

@@ -116,11 +116,14 @@ export default {
         event: "raw_params_received",
         message: `StatusCallback received ${Object.keys(allParams).length} params`,
         method: req.method,
-        contentType: req.headers.get("content-type") ?? "(none)",
+        url: req.url,
         params: allParams,
-        fields_present: Object.keys(allParams),
-        has_recording_url: "RecordingUrl" in allParams || "recording_url" in allParams,
-        has_duration: "Duration" in allParams || "DialCallDuration" in allParams || "duration" in allParams,
+        meta: {
+          contentType: req.headers.get("content-type") ?? "(none)",
+          fieldsPresent: Object.keys(allParams),
+          hasRecordingUrl: "RecordingUrl" in allParams || "recording_url" in allParams,
+          hasDuration: "Duration" in allParams || "DialCallDuration" in allParams || "duration" in allParams,
+        },
       });
 
       const callSid = firstOf(params, "CallSid", "call_sid");
