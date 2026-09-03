@@ -20,7 +20,7 @@ mock call — see "How the order id flows through the call" below.
 - `exotel.ts` - Exotel Voice v1 `Calls/connect` logic
 
 `supabase/functions/dynamic-greeting/` — serves the live call flow to Exotel
-- `index.ts` - Passthru (call-start) + dynamic Gather endpoints
+- `index.ts` - the Greeting, Gather and Passthru endpoints the flow calls
 
 `supabase/functions/update-order-status/` — sole owner of the `recipients` /
 `call_attempts` write
@@ -56,78 +56,98 @@ mock call — see "How the order id flows through the call" below.
   whole recipient/call_attempts module just for a DB handle
 
 ## Two scripts, one Exotel app
-
 There are two IVR scripts — **order confirmation** and **delivery
 confirmation** — and they share **one Exotel app, one App ID and one flow**.
-Nothing in the Exotel flow builder changes to add the second one.
+Nothing in the Exotel flow builder changes to switch between them.
 
-That works because the two scripts have the same shape (a welcome menu, a
-second-level confirm menu on "press 1", one closing per terminal branch) and
-because every word a caller hears is served by this project's own dynamic URLs.
-Exotel only ever decides *which URL to call*; this project decides *what that
-URL says*.
+That works because the two scripts have the same shape (a greeting, one menu,
+one closing per terminal branch) and because every word a caller hears is
+served by this project's own dynamic URLs. Exotel only ever decides *which URL
+to call*; this project decides *what that URL says*.
 
 ### The flow
 
-Three Gather nodes and two Switch Cases. `1` always means "all good" and `2`
-always means "something is wrong", in both scripts.
+One Greeting, one Gather, one Switch Case, two closings. `1` always means
+"all good" and `2` always means "something is wrong", in both scripts.
 
 ```
-                        ┌───────────────────────┐
-                        │  Gather  /welcome     │
-                        │  press 1  |  press 2  │
-                        └────┬─────────────┬────┘
-                          1  │             │  2
-                             ▼             │
-                   ┌───────────────────┐   │
-                   │  Gather  /address │   │
-                   │  press 1 | press 2│   │
-                   └────┬───────────┬──┘   │
-                     1  │           │  2   │
-                        ▼           └──────┤
-              ┌──────────────────┐         ▼
-              │  Gather  /done   │   ┌──────────────────┐
-              │  "confirmed"     │   │  Gather  /issue  │
-              └────────┬─────────┘   │  "we'll call you"│
-                       │             └────────┬─────────┘
-                       ▼                      ▼
-                    Hangup                 Hangup
-              outcome: confirmed      outcome: issue_raised
+                     ┌──────────────────────────┐
+                     │  Greeting  /greeting     │
+                     │  who is calling, and why │
+                     └────────────┬─────────────┘
+                                  ▼
+                     ┌──────────────────────────┐
+                     │  Gather    /welcome      │
+                     │  press 1   |   press 2   │
+                     └────┬────────────────┬────┘
+                       1  │                │  2
+                          ▼                ▼
+             ┌──────────────────┐   ┌──────────────────┐
+             │  Gather  /done   │   │  Gather  /issue  │
+             │  "confirmed"     │   │  "we've logged   │
+             │                  │   │   your request"  │
+             └────────┬─────────┘   └────────┬─────────┘
+                      │                      │
+                      ▼                      ▼
+                   Hangup                 Hangup
+             outcome: confirmed      outcome: issue_raised
 ```
 
 What each node says, per script:
 
 | Node | `order_confirmation` | `delivery_confirmation` |
 | --- | --- | --- |
-| `/welcome` | confirm the order | did you receive the delivery |
-| `/address` | confirm the address | confirm the item delivered |
+| `/greeting` | hello <name>, automated call from mjunction about order <id> | …about the delivery of order <id> |
+| `/welcome` | we have your address as <address> — 1 correct, 2 change it | did it arrive and is it intact — 1 yes, 2 no |
 | `/done` | address confirmed | delivery confirmed |
-| `/issue` | — the same escalation message for every press-2 — | |
+| `/issue` | WhatsApp link to change the address, support call if not | support will call you |
 
-**Both press-2 branches converge on `/issue`.** The caller hears one message —
-*"For your assistance, we're connecting you with our team now. One of our team
-members will call you shortly."* — and the call ends. No transfer is placed;
-the recipient moves to `issue_raised` and an agent picks them up from
-mjunction's escalations queue. At that point the only thing true of all four
-press-2 cases is that a person will follow up, which is why the wording is
-deliberately generic.
+**The second menu is gone.** The old flow asked the caller to confirm the
+order, *then* confirm the address — two menus that between them collected one
+usable fact, because a press-2 on either produced the identical `issue_raised`
+outcome. One menu asks the one question the call exists to settle, and takes
+roughly 20 seconds off every call.
+
+**The two closings now say different things.** They used to share one
+deliberately vague escalation message, because a press-2 could have meant four
+different things and none of them could be named. With a single menu, a
+press-2 means exactly one thing per script, so each closing states what
+happens next: the order script promises a WhatsApp link to change the address
+with a support callback as the fallback, the delivery script promises the
+callback outright.
 
 Outcomes written: `/done` → `confirmed`, `/issue` → `issue_raised`, and a call
-that never reaches a menu → `no_answer` / `not_reachable` from Exotel's
+that never reaches the menu → `no_answer` / `not_reachable` from Exotel's
 terminal status (see "Call recording & terminal status").
 
-Which script to read travels with the call in `CustomField`, the one per-call
-value Exotel echoes to every applet request. `ivr-engine` encodes it as
-`<recipients.unique_id>|oc` or `<recipients.unique_id>|dc`; every applet
-endpoint decodes it with `parseCustomField` (`_shared/flow.ts`). Encoding it
-there rather than looking it up per request keeps each endpoint on its single
--DB-read budget — Exotel abandons an applet URL after 5 seconds.
+### The DTMF digit
 
-**A missing suffix means order confirmation**, so calls placed before this
-existed, and inbound calls (which carry no `CustomField` at all), behave
-exactly as they did. When the suffix is absent but the recipient *is* resolved,
-the flow is inferred from that recipient's status
-(`delivery_confirm_pending`/`delivery_unreachable` → delivery) as a safety net.
+`call_attempts.dtmf_response` records the key the caller pressed — `1` on
+`/done`, `2` on `/issue`. It is **derived from which URL Exotel called**, not
+read off the request: Exotel routes the collected digit through its own Switch
+Case and does not echo it into the branch it picks (confirmed by inspecting a
+live payload — no `digits` / `Digits` / `dtmf` field is present at all on the
+closing steps). Each closing is reachable from exactly one branch, so the
+branch *is* the digit. Anything Exotel does send still wins, as an override.
+
+Before this, every real IVR call finalized with `dtmf_response = null` and
+mjunction's DTMF column was blank for anything but a mock call.
+
+### Outstanding: the WhatsApp hand-off
+
+The order script's press-2 closing tells the caller they will get a WhatsApp
+message with a link to update their address. **Nothing in either repo sends
+that message yet.** What actually happens today is what happened before: the
+recipient moves to `issue_raised` and an agent picks them up from mjunction's
+escalations queue — the support-callback half of what the caller was just
+promised, not the self-service half.
+
+mjunction already has the page the link would point at
+(`/order/change-address/[recipientId]`). What is missing is the send: a
+WhatsApp Business API provider, a template, and a trigger off the
+`issue_raised` transition. Until that exists, either land it or soften
+`orderIssuePrompt` in `dynamic-greeting/index.ts` — an IVR that promises a
+message no one sends is worse than one that promises only the callback.
 
 ### What a delivery-confirmation call writes
 
@@ -136,8 +156,8 @@ Same tables as an order-confirmation call, with two differences:
 - **Status transitions** follow `deliveryConfirmationStatusFor`
   (`_shared/status.ts`): `confirmed` → `confirmed`, `issue_raised` →
   `issue_raised`, no-answer/busy/failed → `delivery_unreachable`. The order
-  script's `orderConfirmationStatusFor` is the mirror image, and both now send
-  every press-2 to `issue_raised`.
+  script's `orderConfirmationStatusFor` is the mirror image, and both send a
+  press-2 to `issue_raised`.
 - **A confirmed delivery seals a VOC** (`sealDeliveryVoc`), which is what the
   vault and the client report read. It needs both a `confirmed` outcome and a
   `recording_url`, and those arrive in an unpredictable order (the outcome from
@@ -164,7 +184,8 @@ Exotel dials the customer and runs the flow
         │
         │  Exotel echoes CustomField on every applet request
         ▼
-GET /dynamic-greeting?step=welcome&CustomField=<unique_id>&CallSid=...
+GET /dynamic-greeting/greeting?CustomField=<unique_id>&CallSid=...
+   then /dynamic-greeting/welcome?CustomField=<unique_id>&CallSid=...
         │
         ▼
 prompt built from that recipient's customer_name, product_name, address
@@ -320,49 +341,113 @@ Path-based routing (`/dynamic-greeting/welcome`, not `?step=welcome`) is
 preferred — it survives Exotel rewriting the query string; `?step=` still
 works as a fallback.
 
-| Applet | Type | URL | Switch Case routing |
+| Applet | Type | URL | Routes to |
 | --- | --- | --- | --- |
-| Call start | Gather | `<FUNCTIONS_URL>/dynamic-greeting/welcome` | 1 → address, 2 → issue |
-| Address confirm | Gather | `<FUNCTIONS_URL>/dynamic-greeting/address` | 1 → done, **2 → issue** |
-| Closing (confirmed) | Gather | `<FUNCTIONS_URL>/dynamic-greeting/done` | → Greeting → Hangup |
-| Closing (issue raised) | Gather | `<FUNCTIONS_URL>/dynamic-greeting/issue` | → Hangup |
+| Call start | **Greeting** | `<FUNCTIONS_URL>/dynamic-greeting/greeting` | → Menu |
+| Menu | **Gather** | `<FUNCTIONS_URL>/dynamic-greeting/welcome` | Switch Case: 1 → Closing (confirmed), 2 → Closing (issue) |
+| Closing (confirmed) | **Greeting** | `<FUNCTIONS_URL>/dynamic-greeting/done` | → Hangup |
+| Closing (issue raised) | **Greeting** | `<FUNCTIONS_URL>/dynamic-greeting/issue` | → Hangup |
+
+Plus one **Switch Case** node between the menu and the two closings, and a
+**Hangup** after each closing. Those three have no dynamic URL — they are pure
+Exotel-side nodes — which is why they are absent from a table about what to
+paste where. The Switch Case is not optional: a Gather applet has a single
+exit, so the digit it collects is inert until something branches on it, and
+that branch is the only thing that tells this function which key was pressed.
+
+**Only the menu is a Gather applet.** Three of the four nodes are Greeting
+applets, because the caller only listens to them — the Switch Case has already
+routed on the keypress by the time a closing is reached, so there is nothing
+left to collect. A Greeting applet's dynamic URL expects `text/plain` (or
+`{"greeting_url": "<audio url>"}`), which is what `greet()` in
+`dynamic-greeting/index.ts` returns; a Gather applet expects the JSON contract
+below and rejects plain text just as flatly as a Greeting applet rejects the
+JSON. Crossing the two is the single most likely way to break this flow.
+
+The closings were Gather applets until recently. Nothing about the status
+write depended on that — a Greeting applet still fetches the URL, so the
+outcome write, the DTMF digit and the step log all fire exactly as before —
+and moving them off Gather drops the ~2 seconds of dead air that
+`speak()`'s nominal digit collection left at the end of every call.
 
 These same four applets serve the delivery-confirmation script too, with
 different prompts — see "Two scripts, one Exotel app" above. The node names
 here are the order-confirmation vocabulary because that flow was built first;
 nothing in Exotel needs renaming or rewiring for the second script.
 
-### Migrating from the old transfer flow (**one-time Exotel change**)
+### Migrating to the single-menu flow (**one-time Exotel change**)
 
-The Address confirm menu's "press 2" used to go to a Greeting and then a
-**Connect** applet that live-transferred the caller to their assigned
-telecaller. That is gone — the `connect-support` and `connect-telecaller`
-functions have been deleted from this repo.
+The flow used to be: Gather (confirm the order) → Gather (confirm the address)
+→ two closings. It is now: **Greeting → Gather → two closings.** The second
+menu is gone and the entry node is a Greeting applet rather than a Gather.
 
-**If your Exotel flow still has those nodes, do this once:**
+**Do this once, in the Exotel flow builder:**
 
-1. On the **Address confirm** Gather's Switch Case, repoint **Case 2** from the
-   Greeting to the existing **Closing (issue raised)** Gather.
-2. Delete the now-orphaned **Greeting** and **Connect** applets.
+1. **Add a Greeting applet as the new call-start node**, pointed at
+   `<FUNCTIONS_URL>/dynamic-greeting/greeting`. It must be a **Greeting**
+   applet, not a Gather — the endpoint answers `text/plain`, which is what a
+   Greeting applet's dynamic URL expects and what a Gather applet rejects.
+   Route it straight to the menu Gather below.
+2. **Repoint the App's entry point** from the old welcome Gather to that new
+   Greeting applet.
+3. **Keep the old welcome Gather as the one menu**, still pointed at
+   `<FUNCTIONS_URL>/dynamic-greeting/welcome`. Its Switch Case changes:
+   **Case 1 → Closing (confirmed)** (it used to go to the Address confirm
+   Gather), Case 2 → Closing (issue raised), unchanged.
+4. **Delete the Address confirm Gather** (`/dynamic-greeting/address`). Nothing
+   routes to it any more.
+5. **Convert both closings from Gather applets to Greeting applets**, keeping
+   their URLs (`/dynamic-greeting/done` and `/dynamic-greeting/issue`)
+   unchanged. Do this *after* step 3, so the Switch Case is already pointing at
+   them.
 
-Until step 1 is done, a second-menu "press 2" still fetches the deleted
-`connect-telecaller` URL, which now 404s — Exotel drops the caller. The code
-change alone does not complete the migration.
+   **This one is not optional and it is not cosmetic.** `/done` and `/issue`
+   answer `text/plain` unconditionally — a Gather applet rejects that, and
+   Exotel drops the caller at the closing. There is no way for the function to
+   serve both shapes: nothing in the request says which applet type asked, so
+   it cannot detect the mismatch and adapt. A flow left with Gather closings
+   against the deployed code loses every call at the last node, *after* the
+   outcome has already been written — so the recipient's status updates
+   correctly and the caller hears nothing, which is the worst of both.
+6. **Check both closings end in Hangup.** Unchanged, but an earlier migration
+   left a Greeting between `/done` and Hangup in some flows — if yours has one,
+   delete it.
 
-If you would rather keep a *separate* closing node for the second menu (to give
-it its own wording later), point that node at
-`<FUNCTIONS_URL>/dynamic-greeting/escalate` instead — `escalate` and
-`address-issue` are accepted aliases of `issue` and behave identically.
+Order matters twice over.
 
-If the functions are still deployed from a previous release, remove them:
+Within the flow, do step 3 before step 4, or a "press 1" routes to a node that
+no longer exists and Exotel drops the caller.
+
+Between the flow and the code, **step 5 and `supabase functions deploy
+dynamic-greeting` have to land together.** Deploy the code while the closings
+are still Gather applets and every call dies at the closing; convert the
+closings first while the old code is live and they die there instead, because
+the old code answers Gather JSON. If you cannot do both at once, convert the
+closings immediately after the deploy and accept a short window of dropped
+closings — the outcome write happens before the response, so nothing is lost
+but the goodbye.
+
+**Until step 3 is done, calls still work.** `/dynamic-greeting/address` is
+accepted as an alias of the menu, so a flow still wired the old way asks the
+same question twice and the caller presses 1 again to reach the same closing —
+degraded, not broken. Remove the alias from `dynamic-greeting/index.ts` once
+every environment is migrated.
+
+If you would rather keep a *separately named* closing node for the press-2
+branch, point it at `<FUNCTIONS_URL>/dynamic-greeting/escalate` — `escalate`
+and `address-issue` are accepted aliases of `issue` and behave identically.
+
+Any unrecognised `step` on `dynamic-greeting` still returns a valid closing
+message rather than a 404, so a half-migrated flow ends calls cleanly instead
+of cutting them off.
+
+If the retired transfer functions are still deployed from an older release,
+remove them:
 
 ```bash
 supabase functions delete connect-support
 supabase functions delete connect-telecaller
 ```
-
-Any unrecognised `step` on `dynamic-greeting` still returns a valid closing
-message rather than a 404.
 
 `status-callback` is **not** wired into the Exotel flow builder like the
 applets above — it is not an applet at all. `ivr-engine` passes it as the
@@ -371,17 +456,18 @@ applets above — it is not an applet at all. `ivr-engine` passes it as the
 Exotel-side configuration needed. See "Call recording & terminal status"
 below.
 
-All Gather applets above conform to the same response contract; the closing
-messages are Gather applets too,
-not Greeting applets — a Greeting applet's dynamic URL expects a different body
-(`{"greeting_url": "..."}` or `text/plain`) and would reject the Gather payload
-this function returns.
-
 ### Response contract
 
-Every response conforms to Exotel's documented Gather schema: `gather_prompt`
-(mandatory, `text` or `audio_url`), `max_input_digits`, `finish_on_key`,
-`input_timeout`, `repeat_menu`, `repeat_gather_prompt` — HTTP 200 with
+There are **two** contracts, one per applet type, and they are not
+interchangeable — see the applet table above for which node gets which.
+
+A **Greeting** applet (the opening and both closings) gets `text/plain`: the
+body is simply the text to speak. `greet()` serves these.
+
+A **Gather** applet (the menu) gets Exotel's documented Gather schema:
+`gather_prompt` (mandatory, `text` or `audio_url`), `max_input_digits`,
+`finish_on_key`, `input_timeout`, `repeat_menu`, `repeat_gather_prompt` —
+HTTP 200 with
 `Content-Type: application/json`.
 
 `max_input_digits` and `finish_on_key` are always sent explicitly, because

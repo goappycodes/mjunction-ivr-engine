@@ -67,8 +67,8 @@ const RECIPIENT_COLUMNS = [
 export const DB_TIMEOUT_MS = 1500;
 
 export async function withTimeout<T>(
-  // PromiseLike, not Promise: a Postgrest query builder (e.g. the chain
-  // passed in by getPriorStepInput) implements .then() but not the rest of
+  // PromiseLike, not Promise: a Postgrest query builder (e.g. the chains
+  // passed in by the lookups below) implements .then() but not the rest of
   // the Promise interface, so it isn't assignable to Promise<T> even though
   // Promise.race below accepts it natively.
   work: PromiseLike<T>,
@@ -281,73 +281,42 @@ export function logCallStep(entry: CallLogEntry): void {
  * trace (`ivr_logs` has already been overwritten with the latest step). This
  * reads it back so the final outcome can take both answers into account.
  */
-export async function getPriorStepInput(
-  callSid: string,
-  step: string,
-): Promise<string> {
-  const client = db();
-  if (!client || !callSid) return "";
-
-  const { data, error } = await withTimeout(
-    client
-      .from("ivr_call_events")
-      .select("user_input")
-      .eq("call_sid", callSid)
-      .eq("step", step)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle(),
-    { data: null, error: null },
-    "getPriorStepInput",
-  );
-
-  if (error) {
-    console.error("[getPriorStepInput] failed:", error.code, error.message);
-    return "";
-  }
-  const input = (data as { user_input?: string } | null)?.user_input;
-  return input && input !== "none" ? input : "";
-}
-
 /**
- * Order-confirmation outcome from the two Gather answers (welcome-menu digit,
- * address-menu digit). A reported address problem wins over an order-level
- * "press 2" — it is the more specific, more actionable signal — otherwise an
- * order-level issue routes to `transferred_to_agent`, otherwise it's a clean
- * confirm. Matches the wording the call script and OUTCOME_LABELS (mjunction)
- * already commit to: outcome `confirmed` = "press 1", `corrected` = "press 2".
- */
-export function resolveOrderConfirmationOutcome(
-  welcomeDigit: string,
-  addressDigit: string,
-): CallOutcome {
-  // Both menus' "press 2" now mean the same thing — this order needs a human
-  // — since the live transfer that used to distinguish them is retired. See
-  // the ISSUE_RAISED note in _shared/status.ts.
-  if (addressDigit === "2" || welcomeDigit === "2") return "issue_raised";
-  return "confirmed";
-}
-
-/**
- * Delivery-confirmation outcome from the same two Gather answers, read against
- * the delivery script instead of the address one (welcome-menu digit = "did
- * you receive it", second-menu digit = "is the item right"). The shapes match
- * because both scripts run on the same Exotel flow graph — see
- * `_shared/flow.ts` — but the meanings do not, which is why this is a separate
- * function rather than a shared one with a flag:
+ * Order-confirmation outcome from the menu digit.
  *
- *   - second menu "2" (item wrong/damaged) -> `issue_raised`.
- *   - welcome "2" (never received it) -> `issue_raised` too. A non-delivery is
- *     an issue with this delivery, not an unreachable call.
+ * There is one menu now, so there is one digit: "1" confirms the delivery
+ * address, "2" asks to change it. Both scripts read the digit the same way
+ * (see `resolveDeliveryConfirmationOutcome`), which is what lets them share a
+ * single Exotel flow graph — `_shared/flow.ts`.
+ *
+ * This is the fallback path only. `dynamic-greeting` sends `update-order-status`
+ * an explicit outcome on both terminal steps, because the branch Exotel routed
+ * to already says which digit was pressed; this resolver runs when the digit
+ * is all that was supplied (a manual retry, admin tooling).
+ *
+ * Matches the wording the call script and OUTCOME_LABELS (mjunction) already
+ * commit to: `confirmed` = "press 1", `issue_raised` = "press 2".
+ */
+export function resolveOrderConfirmationOutcome(digit: string): CallOutcome {
+  // "Press 2" means this order needs a human — an address to be changed. See
+  // the ISSUE_RAISED note in _shared/status.ts.
+  return digit === "2" ? "issue_raised" : "confirmed";
+}
+
+/**
+ * Delivery-confirmation outcome from the same single menu digit, read against
+ * the delivery script instead of the address one ("did you receive it, and is
+ * it in good condition"). The shape matches because both scripts run on the
+ * same Exotel flow graph — see `_shared/flow.ts` — but the meaning does not,
+ * which is why this stays a separate function rather than a shared one with a
+ * flag:
+ *
+ *   - "2" (not received, or damaged/wrong) -> `issue_raised`. A non-delivery
+ *     is an issue with this delivery, not an unreachable call.
  *   - otherwise -> a clean `confirmed`, which is what seals the VOC.
  */
-export function resolveDeliveryConfirmationOutcome(
-  welcomeDigit: string,
-  itemDigit: string,
-): CallOutcome {
-  if (itemDigit === "2") return "issue_raised";
-  if (welcomeDigit === "2") return "issue_raised";
-  return "confirmed";
+export function resolveDeliveryConfirmationOutcome(digit: string): CallOutcome {
+  return digit === "2" ? "issue_raised" : "confirmed";
 }
 
 // ---------------------------------------------------------------------------
@@ -997,23 +966,27 @@ export function notifyPortalCallRecordsRefresh(recipientId: string): void {
 // Cross-function notification — written by `update-order-status`, triggered
 // by `dynamic-greeting` when the Gather flow finishes.
 //
-// dynamic-greeting knows which call_sid this is and (at most)
-// the single digit their own step just collected, but are not allowed to
-// write to `recipients` / `call_attempts` themselves, and must not add a
-// blocking DB read to their own response — every millisecond there counts
-// against Exotel's 5s abandon timer. So the actual outcome resolution
-// (combining this digit with an earlier one, via `getPriorStepInput` +
-// `resolveOrderConfirmationOutcome`) happens inside `update-order-status`
-// instead, which runs after the Exotel response has already gone out. That
-// keeps the two responsibilities (IVR flow vs. state mutation) independent
-// and redeployable on their own, same as before.
+// dynamic-greeting knows which call_sid this is, which branch of the menu
+// Exotel routed to, and therefore both the outcome and the digit that
+// produced it — but it is not allowed to write to `recipients` /
+// `call_attempts` itself, and must not add a blocking DB write to its own
+// response: every millisecond there counts against Exotel's 5s abandon
+// timer. So the write happens inside `update-order-status` instead, which
+// runs after the Exotel response has already gone out. That keeps the two
+// responsibilities (IVR flow vs. state mutation) independent and
+// redeployable on their own, same as before.
 // ---------------------------------------------------------------------------
 
 export interface OrderStatusNotification {
   orderId: string;
   callSid: string;
   callerNumber?: string;
-  /** Address-menu digit — set when this notification comes from the Gather flow finishing. */
+  /**
+   * The digit the caller pressed on the menu. `dynamic-greeting` sends it on
+   * every terminal step (derived from the branch Exotel routed to, since
+   * Exotel does not echo the digit into that request), so a real call now
+   * lands a `call_attempts.dtmf_response` instead of the null it used to.
+   */
   dtmf?: string;
   /**
    * Explicit outcome, for triggers that are not a keypress — e.g. a support
