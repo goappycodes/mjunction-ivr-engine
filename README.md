@@ -399,15 +399,33 @@ menu is gone and the entry node is a Greeting applet rather than a Gather.
 5. **Convert both closings from Gather applets to Greeting applets**, keeping
    their URLs (`/dynamic-greeting/done` and `/dynamic-greeting/issue`)
    unchanged. Do this *after* step 3, so the Switch Case is already pointing at
-   them. Leaving them as Gather applets does not break the call — the code
-   still answers, and the fallback paths still pick the right shape — but the
-   caller hears the trailing dead air the Gather timeout produces.
+   them.
+
+   **This one is not optional and it is not cosmetic.** `/done` and `/issue`
+   answer `text/plain` unconditionally — a Gather applet rejects that, and
+   Exotel drops the caller at the closing. There is no way for the function to
+   serve both shapes: nothing in the request says which applet type asked, so
+   it cannot detect the mismatch and adapt. A flow left with Gather closings
+   against the deployed code loses every call at the last node, *after* the
+   outcome has already been written — so the recipient's status updates
+   correctly and the caller hears nothing, which is the worst of both.
 6. **Check both closings end in Hangup.** Unchanged, but an earlier migration
    left a Greeting between `/done` and Hangup in some flows — if yours has one,
    delete it.
 
-Order matters: do step 3 before step 4, or a "press 1" routes to a node that no
-longer exists and Exotel drops the caller.
+Order matters twice over.
+
+Within the flow, do step 3 before step 4, or a "press 1" routes to a node that
+no longer exists and Exotel drops the caller.
+
+Between the flow and the code, **step 5 and `supabase functions deploy
+dynamic-greeting` have to land together.** Deploy the code while the closings
+are still Gather applets and every call dies at the closing; convert the
+closings first while the old code is live and they die there instead, because
+the old code answers Gather JSON. If you cannot do both at once, convert the
+closings immediately after the deploy and accept a short window of dropped
+closings — the outcome write happens before the response, so nothing is lost
+but the goodbye.
 
 **Until step 3 is done, calls still work.** `/dynamic-greeting/address` is
 accepted as an alias of the menu, so a flow still wired the old way asks the
