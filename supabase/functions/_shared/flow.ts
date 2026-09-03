@@ -13,8 +13,11 @@
  *   ------------------------------    -------------------    ---------------------
  *   Greeting  /greeting               who is calling, why    who is calling, why
  *   Gather    /welcome                is this address right  did it arrive, intact
- *   Gather    /done      (case 1)     address confirmed      delivery confirmed
- *   Gather    /issue     (case 2)     address change asked   delivery issue raised
+ *   Greeting  /done      (case 1)     address confirmed      delivery confirmed
+ *   Greeting  /issue     (case 2)     address change asked   delivery issue raised
+ *
+ * Only /welcome is a Gather: it is the one node that collects a keypress. The
+ * rest are Greeting applets and answer text/plain.
  *
  * The variant travels with the call in Exotel's `CustomField`, which is the
  * only per-call value Exotel echoes to every applet request. Encoding it there

@@ -22,23 +22,30 @@ const JSON_HEADERS = {
 };
 
 // ---------------------------------------------------------------------------
-// Exotel Gather applet response contract
+// Exotel applet response contracts — there are TWO, and they are not
+// interchangeable. Serving one to an applet expecting the other makes Exotel
+// abandon the applet and drop the caller, exactly as a 404 or a timeout would.
 //
-// Documented schema:
-//   gather_prompt          object   REQUIRED  { text } or { audio_url }
-//   max_input_digits       int      optional  default 255
-//   finish_on_key          string   optional  default "#"; "" means no finish key
-//   input_timeout          int      optional  default 5 (seconds between keys)
-//   repeat_menu            int      optional  default 0
-//   repeat_gather_prompt   object   optional  defaults to gather_prompt
+// GREETING applet (the opening and both closings — three of the four nodes):
+//   Content-Type: text/plain, body is the text to speak.
+//   JSON `{"greeting_url": "<audio url>"}` is the documented alternative.
+//   -> greet()
 //
-// Must be HTTP 200 with Content-Type: application/json. Anything else — a 404, a
-// non-JSON body, or no reply within 5 seconds — makes Exotel abandon the applet
-// and drop the caller. Every response below therefore goes through gather(),
-// speak() or greet(); no code path may return a bare error to Exotel.
+// GATHER applet (the menu — the one node that collects a keypress):
+//   Content-Type: application/json, documented schema:
+//     gather_prompt          object   REQUIRED  { text } or { audio_url }
+//     max_input_digits       int      optional  default 255
+//     finish_on_key          string   optional  default "#"; "" means no finish key
+//     input_timeout          int      optional  default 5 (seconds between keys)
+//     repeat_menu            int      optional  default 0
+//     repeat_gather_prompt   object   optional  defaults to gather_prompt
+//   -> gather(), or speak() for the play-only fallback case
 //
-// greet() is the one exception to the JSON contract, because the Greeting
-// applet it serves has a different one — see greet() below.
+// Both must be HTTP 200, within 5 seconds. Every response below therefore goes
+// through gather(), greet(), speak() or fallbackSay(); no code path may return
+// a bare error to Exotel. The two paths that answer without knowing which node
+// asked — the unknown-step branch and the exception handler — pick their shape
+// via fallbackSay()/GATHER_STEPS rather than assuming.
 // ---------------------------------------------------------------------------
 
 function gather(text: string, repeatText?: string) {
@@ -64,11 +71,16 @@ function gather(text: string, repeatText?: string) {
 }
 
 /**
- * Closing message. Still a Gather payload, because these steps are wired to
- * Gather applets — a Greeting applet expects a different body entirely
- * (`{"greeting_url": ...}` or text/plain). Gather has no documented play-only
- * mode, so a digit is nominally collected and discarded; the short timeout keeps
- * the trailing dead air down.
+ * Play-only *Gather* payload: a message with nothing useful to collect.
+ *
+ * Only the fallback paths use this now — the unknown-step branch and the
+ * top-level exception handler, either of which can land on the menu node,
+ * which is a Gather applet and would reject plain text. Everything the caller
+ * merely listens to is a Greeting applet and goes through greet() instead.
+ *
+ * Gather has no documented play-only mode, so a digit is nominally collected
+ * and discarded; the short timeout keeps the trailing dead air down. That dead
+ * air is exactly why the closings no longer come through here.
  */
 function speak(text: string) {
   return Response.json(
@@ -83,11 +95,19 @@ function speak(text: string) {
 }
 
 /**
- * Greeting message. This is the ONE response in this function that is not a
- * Gather payload: Exotel's Greeting applet fetches its dynamic URL expecting
- * either `text/plain` (spoken via TTS, what this returns) or JSON
- * `{"greeting_url": "<audio url>"}`. Handing it the Gather body every other
- * step returns would be rejected and the caller dropped.
+ * Spoken message for a *Greeting* applet: the opening and both closings.
+ *
+ * Exotel's Greeting applet fetches its dynamic URL expecting either
+ * `text/plain` (spoken via TTS, what this returns) or JSON
+ * `{"greeting_url": "<audio url>"}`. Hand it the Gather body and it is
+ * rejected and the caller dropped — and the reverse is just as fatal, which is
+ * what GATHER_STEPS below exists to get right on the fallback paths.
+ *
+ * A closing belongs here rather than on a Gather applet because there is
+ * nothing left to collect: the Switch Case has already routed on the keypress,
+ * so the node only has to say its piece and hand over to Hangup. The endpoint
+ * is still fetched, so the status write and the step log fire exactly as they
+ * did when these were Gather nodes.
  */
 function greet(text: string) {
   return new Response(clean(text), {
@@ -110,6 +130,31 @@ function greet(text: string) {
  */
 const CONFIRM_DIGIT = "1";
 const ISSUE_DIGIT = "2";
+
+/**
+ * The only steps wired to a **Gather** applet — the one menu, plus its
+ * aliases. Every other step is a **Greeting** applet: the opening, both
+ * closings, and anything unrecognised, none of which collect a keypress.
+ *
+ * This exists for the two paths that have to answer without knowing which node
+ * asked — the unknown-step branch and the exception handler. Answering with
+ * the wrong shape is fatal either way (a Gather applet rejects plain text as
+ * flatly as a Greeting applet rejects the Gather JSON), so those paths pick
+ * from here rather than assuming.
+ */
+const GATHER_STEPS = new Set(["welcome", "menu", "address"]);
+
+/**
+ * Say `text` in whichever shape the node that called us can accept.
+ *
+ * An unrecognised step resolves to Greeting, which is the better bet on two
+ * counts: three of the flow's four nodes are Greeting applets, and the far
+ * likelier cause of an unknown step — a mistyped closing URL — is a Greeting
+ * node being asked to say goodbye, which is exactly what it then does.
+ */
+function fallbackSay(step: string, text: string) {
+  return GATHER_STEPS.has(step) ? speak(text) : greet(text);
+}
 
 /** Collapse whitespace so the TTS engine gets a clean single-line prompt. */
 function clean(text: string): string {
@@ -712,7 +757,8 @@ export default {
         }
 
         // ------------------------------------------------------------------
-        // Node 3 of 3 — the two closings. Each is reached from exactly one
+        // Node 3 of 3 — the two closings, both **Greeting** applets. Each is
+        // reached from exactly one
         // Switch Case branch of the menu above, so *which URL Exotel called
         // is itself the keypress*: `done` can only be a "1" and `issue` can
         // only be a "2". That is why both the outcome and the DTMF digit are
@@ -756,7 +802,7 @@ export default {
             });
           }
 
-          const response = speak(
+          const response = greet(
             isDelivery ? deliveryConfirmedPrompt() : orderConfirmedPrompt(),
           );
 
@@ -813,7 +859,7 @@ export default {
             });
           }
 
-          const response = speak(
+          const response = greet(
             isDelivery ? deliveryIssuePrompt() : orderIssuePrompt(),
           );
 
@@ -839,8 +885,9 @@ export default {
         }
 
         default: {
-          // Unknown step still answers 200 + JSON so the call ends cleanly
-          // instead of being cut off by Exotel.
+          // Unknown step still answers 200 so the call ends cleanly instead of
+          // being cut off by Exotel — in whichever body shape the node that
+          // called us can read. See fallbackSay().
           logCallStep({
             callSid,
             callerNumber,
@@ -851,7 +898,10 @@ export default {
             appletHint,
           });
 
-          const response = speak("Thank you for calling mjunction. Goodbye.");
+          const response = fallbackSay(
+            step,
+            "Thank you for calling mjunction. Goodbye.",
+          );
 
           logEvent({
             fn: "dynamic-greeting",
@@ -886,10 +936,14 @@ export default {
         durationMs: Date.now() - startedAt,
       });
 
-      // Exotel must still get a valid Gather body; anything else surfaces a real
-      // error so genuine bugs stay visible to non-IVR callers.
+      // Exotel must still get a body the calling applet accepts, which now
+      // depends on which node it was — the step is re-read from the path here
+      // because the throw may have happened before it was resolved. Anything
+      // else surfaces a real error so genuine bugs stay visible to non-IVR
+      // callers.
       if (isIvrPath) {
-        return speak(
+        return fallbackSay(
+          stepFromPath(url.pathname),
           `
 We apologize.
 

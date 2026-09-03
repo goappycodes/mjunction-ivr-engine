@@ -344,16 +344,31 @@ works as a fallback.
 | Applet | Type | URL | Routes to |
 | --- | --- | --- | --- |
 | Call start | **Greeting** | `<FUNCTIONS_URL>/dynamic-greeting/greeting` | → Menu |
-| Menu | Gather | `<FUNCTIONS_URL>/dynamic-greeting/welcome` | Switch Case: 1 → Closing (confirmed), 2 → Closing (issue) |
-| Closing (confirmed) | Gather | `<FUNCTIONS_URL>/dynamic-greeting/done` | → Hangup |
-| Closing (issue raised) | Gather | `<FUNCTIONS_URL>/dynamic-greeting/issue` | → Hangup |
+| Menu | **Gather** | `<FUNCTIONS_URL>/dynamic-greeting/welcome` | Switch Case: 1 → Closing (confirmed), 2 → Closing (issue) |
+| Closing (confirmed) | **Greeting** | `<FUNCTIONS_URL>/dynamic-greeting/done` | → Hangup |
+| Closing (issue raised) | **Greeting** | `<FUNCTIONS_URL>/dynamic-greeting/issue` | → Hangup |
 
-The call-start applet is the one **Greeting** applet in the flow, and it is the
-one endpoint here that does not answer the Gather JSON contract — a Greeting
-applet's dynamic URL expects `text/plain` (or `{"greeting_url": "<audio url>"}`),
-which is what `greet()` in `dynamic-greeting/index.ts` returns. Wiring a Gather
-applet to `/greeting`, or the Greeting applet to a Gather URL, breaks the call
-in either direction.
+Plus one **Switch Case** node between the menu and the two closings, and a
+**Hangup** after each closing. Those three have no dynamic URL — they are pure
+Exotel-side nodes — which is why they are absent from a table about what to
+paste where. The Switch Case is not optional: a Gather applet has a single
+exit, so the digit it collects is inert until something branches on it, and
+that branch is the only thing that tells this function which key was pressed.
+
+**Only the menu is a Gather applet.** Three of the four nodes are Greeting
+applets, because the caller only listens to them — the Switch Case has already
+routed on the keypress by the time a closing is reached, so there is nothing
+left to collect. A Greeting applet's dynamic URL expects `text/plain` (or
+`{"greeting_url": "<audio url>"}`), which is what `greet()` in
+`dynamic-greeting/index.ts` returns; a Gather applet expects the JSON contract
+below and rejects plain text just as flatly as a Greeting applet rejects the
+JSON. Crossing the two is the single most likely way to break this flow.
+
+The closings were Gather applets until recently. Nothing about the status
+write depended on that — a Greeting applet still fetches the URL, so the
+outcome write, the DTMF digit and the step log all fire exactly as before —
+and moving them off Gather drops the ~2 seconds of dead air that
+`speak()`'s nominal digit collection left at the end of every call.
 
 These same four applets serve the delivery-confirmation script too, with
 different prompts — see "Two scripts, one Exotel app" above. The node names
@@ -381,9 +396,15 @@ menu is gone and the entry node is a Greeting applet rather than a Gather.
    Gather), Case 2 → Closing (issue raised), unchanged.
 4. **Delete the Address confirm Gather** (`/dynamic-greeting/address`). Nothing
    routes to it any more.
-5. **Check both closings end in Hangup.** Unchanged, but the previous
-   migration left a Greeting between `/done` and Hangup in some flows — if
-   yours has one, delete it.
+5. **Convert both closings from Gather applets to Greeting applets**, keeping
+   their URLs (`/dynamic-greeting/done` and `/dynamic-greeting/issue`)
+   unchanged. Do this *after* step 3, so the Switch Case is already pointing at
+   them. Leaving them as Gather applets does not break the call — the code
+   still answers, and the fallback paths still pick the right shape — but the
+   caller hears the trailing dead air the Gather timeout produces.
+6. **Check both closings end in Hangup.** Unchanged, but an earlier migration
+   left a Greeting between `/done` and Hangup in some flows — if yours has one,
+   delete it.
 
 Order matters: do step 3 before step 4, or a "press 1" routes to a node that no
 longer exists and Exotel drops the caller.
@@ -417,19 +438,18 @@ applets above — it is not an applet at all. `ivr-engine` passes it as the
 Exotel-side configuration needed. See "Call recording & terminal status"
 below.
 
-The **menu and both closings are Gather applets** and conform to the same
-response contract below. Only the call-start node is a Greeting applet, and it
-is the only one served by `greet()` rather than `gather()` / `speak()` — a
-Greeting applet's dynamic URL expects `text/plain` (or
-`{"greeting_url": "..."}`) and would reject a Gather payload, and a Gather
-applet rejects the plain text just as flatly. Getting these two crossed is the
-single most likely way to break this flow.
-
 ### Response contract
 
-Every response conforms to Exotel's documented Gather schema: `gather_prompt`
-(mandatory, `text` or `audio_url`), `max_input_digits`, `finish_on_key`,
-`input_timeout`, `repeat_menu`, `repeat_gather_prompt` — HTTP 200 with
+There are **two** contracts, one per applet type, and they are not
+interchangeable — see the applet table above for which node gets which.
+
+A **Greeting** applet (the opening and both closings) gets `text/plain`: the
+body is simply the text to speak. `greet()` serves these.
+
+A **Gather** applet (the menu) gets Exotel's documented Gather schema:
+`gather_prompt` (mandatory, `text` or `audio_url`), `max_input_digits`,
+`finish_on_key`, `input_timeout`, `repeat_menu`, `repeat_gather_prompt` —
+HTTP 200 with
 `Content-Type: application/json`.
 
 `max_input_digits` and `finish_on_key` are always sent explicitly, because
