@@ -3,20 +3,18 @@
  *
  * Both scripts run on the **same Exotel app / App ID and the same flow
  * graph**. That is possible because the delivery-confirmation script has the
- * exact same shape as the order-confirmation one — a welcome menu, a
- * second-level confirm menu on "press 1", a closing message on each terminal
- * branch, and a live transfer on the second-level "press 2" — and because
- * every word a caller hears is served by this project's own dynamic URLs, not
+ * exact same shape as the order-confirmation one — a greeting, one menu, and
+ * a closing message on each of the two terminal branches — and because every
+ * word a caller hears is served by this project's own dynamic URLs, not
  * configured in Exotel's flow builder. Exotel only ever decides *which URL to
  * call*; this module decides *what that URL says*.
  *
- *   Flow node (unchanged in Exotel)   order_confirmation     delivery_confirmation
+ *   Flow node (same for both)         order_confirmation     delivery_confirmation
  *   ------------------------------    -------------------    ---------------------
- *   Gather  /welcome                  confirm the order      confirm delivery received
- *   Gather  /address   (case 1)       confirm the address    confirm the item delivered
- *   Gather  /done      (case 1,1)     address confirmed      delivery confirmed
- *   Gather  /issue     (case 2)       order issue raised     delivery issue raised
- *   Connect            (case 1,2)     -> telecaller          -> telecaller
+ *   Greeting  /greeting               who is calling, why    who is calling, why
+ *   Gather    /welcome                is this address right  did it arrive, intact
+ *   Gather    /done      (case 1)     address confirmed      delivery confirmed
+ *   Gather    /issue     (case 2)     address change asked   delivery issue raised
  *
  * The variant travels with the call in Exotel's `CustomField`, which is the
  * only per-call value Exotel echoes to every applet request. Encoding it there

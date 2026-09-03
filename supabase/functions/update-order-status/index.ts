@@ -3,7 +3,6 @@ import {
   type CallOutcome,
   finalizeCallAttempt,
   getOpenCallAttemptByCallSid,
-  getPriorStepInput,
   getRecipientStatus,
   resolveDeliveryConfirmationOutcome,
   resolveOrderConfirmationOutcome,
@@ -26,8 +25,9 @@ interface UpdateOrderStatusBody {
   callerNumber?: string;
   dtmf?: string;
   /**
-   * Explicit outcome sent by dynamic-greeting when the step reached already
-   * determines the result. Takes precedence over `dtmf`.
+   * Explicit outcome sent by dynamic-greeting on every terminal step, since
+   * the step reached already determines the result. Takes precedence over
+   * `dtmf`, which is then recorded alongside it as what the caller pressed.
    */
   outcome?: string;
 }
@@ -173,11 +173,11 @@ export default {
         return json({ success: false, error: `Recipient not found: ${orderId}` }, 404);
       }
 
-      // An explicit outcome (the terminal step's own result) wins outright. Only
-      // a keypress needs the extra lookup: the second-menu digit alone is
-      // ambiguous without the welcome-menu digit from the previous step (see
-      // resolveOrderConfirmationOutcome), so that read only happens on this
-      // path, which is already off Exotel's response critical path.
+      // An explicit outcome (the terminal step's own result) wins outright,
+      // and dynamic-greeting sends one on every terminal step — the branch
+      // Exotel routed to already determines the result. The resolver below is
+      // the fallback for a caller that supplied only a digit (a manual retry,
+      // admin tooling).
       //
       // Which resolver applies comes from the call_attempts row this call
       // opened, not from anything the notification carries — the two scripts
@@ -187,8 +187,7 @@ export default {
         ? resolveDeliveryConfirmationOutcome
         : resolveOrderConfirmationOutcome;
 
-      const outcome: CallOutcome = explicitOutcome ||
-        resolveOutcome(await getPriorStepInput(callSid, "address"), dtmf);
+      const outcome: CallOutcome = explicitOutcome || resolveOutcome(dtmf);
 
       await finalizeCallAttempt({
         callAttemptId: attempt.id,

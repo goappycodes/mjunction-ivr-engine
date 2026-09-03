@@ -34,8 +34,11 @@ const JSON_HEADERS = {
 //
 // Must be HTTP 200 with Content-Type: application/json. Anything else — a 404, a
 // non-JSON body, or no reply within 5 seconds — makes Exotel abandon the applet
-// and drop the caller. Every response below therefore goes through gather() or
-// speak(); no code path may return a bare error to Exotel.
+// and drop the caller. Every response below therefore goes through gather(),
+// speak() or greet(); no code path may return a bare error to Exotel.
+//
+// greet() is the one exception to the JSON contract, because the Greeting
+// applet it serves has a different one — see greet() below.
 // ---------------------------------------------------------------------------
 
 function gather(text: string, repeatText?: string) {
@@ -78,6 +81,35 @@ function speak(text: string) {
     { status: 200, headers: JSON_HEADERS },
   );
 }
+
+/**
+ * Greeting message. This is the ONE response in this function that is not a
+ * Gather payload: Exotel's Greeting applet fetches its dynamic URL expecting
+ * either `text/plain` (spoken via TTS, what this returns) or JSON
+ * `{"greeting_url": "<audio url>"}`. Handing it the Gather body every other
+ * step returns would be rejected and the caller dropped.
+ */
+function greet(text: string) {
+  return new Response(clean(text), {
+    status: 200,
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
+/**
+ * The two menu digits, as the closings record them.
+ *
+ * Exotel routes the collected digit through its own Switch Case and does not
+ * echo it into the branch it picks, so the closing step cannot read what was
+ * pressed — but it does not need to: each closing is reachable from exactly
+ * one branch, so the branch *is* the digit. See the `done` / `issue` cases.
+ */
+const CONFIRM_DIGIT = "1";
+const ISSUE_DIGIT = "2";
 
 /** Collapse whitespace so the TTS engine gets a clean single-line prompt. */
 function clean(text: string): string {
@@ -269,140 +301,163 @@ async function resolveOrder(
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Prompts come in pairs — one per script — because the same four Exotel flow
+// Prompts come in pairs — one per script — because the same three Exotel flow
 // nodes serve both (see _shared/flow.ts). Each pair keeps the same digit
 // meanings (1 = all good, 2 = something is wrong) so a caller who has taken
 // both calls hears a consistent menu, and so the Switch Case wiring in Exotel
 // stays valid for either script without being touched.
+//
+// The call is deliberately short: one greeting, one question, one closing.
+// An IVR that asks the same person two questions in a row loses callers
+// between menus, and the second menu never carried information the first one
+// did not — a press-2 on either produced the identical `issue_raised`
+// outcome. Merging them costs nothing and takes roughly 20 seconds off every
+// call.
 // ---------------------------------------------------------------------------
 
-function welcomePrompt(order: OrderRecord | null): string {
-  if (!order) {
-    return `This is an automated call regarding your recent order.
-
-      To confirm your order, please press 1.
-
-      If you would like to report an issue with this order, please press 2.`;
-  }
-
-  const greeting = order.customer_name
-    ? `Hello ${order.customer_name}.`
-    : "Hello.";
-  const from = order.company_name ? ` from ${order.company_name}` : "";
-  const item = order.product_name ? ` for ${order.product_name}` : "";
-
-  return `${greeting} This is an automated call${from} regarding your order
-    ${spellReference(order.order_id)}${item}.
-
-    To confirm your order, please press 1.
-
-    If you would like to report an issue with this order, please press 2.`;
+/** How the caller is addressed, in either script. */
+function salutation(order: OrderRecord | null): string {
+  return order?.customer_name ? `Hello ${order.customer_name}.` : "Hello.";
 }
 
-function addressPrompt(order: OrderRecord | null): string {
-  if (!order?.delivery_address) {
-    return `Please confirm your delivery address.
-
-      If your delivery address is correct, please press 1.
-
-      If there is an issue with your delivery address, please press 2.`;
+/**
+ * Greeting node — plays once, collects nothing, then falls through to the
+ * menu. Kept to a single sentence of who is calling and why: callers decide
+ * whether to stay on the line in the first few seconds, and anything they
+ * need in order to answer the question belongs in the menu itself, where it
+ * is repeated if they do not respond.
+ */
+function orderGreeting(order: OrderRecord | null): string {
+  if (!order) {
+    return `${salutation(order)} This is an automated call from mjunction
+      regarding your recent order.`;
   }
 
-  // The order reference is spoken once, in the welcome prompt. Repeating a
-  // digit-by-digit id on every step makes the call tedious to sit through.
-  return `Our records show your delivery address as
+  const item = order.product_name ? ` for ${order.product_name}` : "";
 
-    ${order.delivery_address}.
+  return `${salutation(order)} This is an automated call from mjunction
+    regarding your order ${spellReference(order.order_id)}${item}.`;
+}
 
-    If this address is correct, please press 1.
+function deliveryGreeting(order: OrderRecord | null): string {
+  if (!order) {
+    return `${salutation(order)} This is an automated call from mjunction
+      regarding the delivery of your recent order.`;
+  }
 
-    If there is an issue with this address, please press 2.`;
+  const item = order.product_name ? ` for ${order.product_name}` : "";
+
+  return `${salutation(order)} This is an automated call from mjunction
+    regarding the delivery of your order ${spellReference(order.order_id)}${item}.`;
+}
+
+/**
+ * The one and only menu in the order-confirmation script.
+ *
+ * It reads the address back and asks for a single keypress, because the
+ * address is the only thing this call exists to settle — the separate
+ * "confirm the order, then confirm the address" pair it replaces asked the
+ * caller to press 1 twice to say one thing.
+ */
+function orderMenuPrompt(order: OrderRecord | null): string {
+  if (!order?.delivery_address) {
+    return `To confirm your delivery address, press 1.
+
+      If you would like to change your delivery address, press 2.`;
+  }
+
+  return `We have your delivery address as ${order.delivery_address}.
+
+    If this address is correct, press 1.
+
+    If you would like to change it, press 2.`;
+}
+
+/** The order menu's re-prompt, played when no key is pressed in time. */
+function orderMenuRepeat(): string {
+  return `Sorry, we did not get your response.
+
+    To confirm your delivery address, press 1.
+
+    To change your delivery address, press 2.`;
+}
+
+/**
+ * The one and only menu in the delivery-confirmation script, on the same
+ * Exotel node as the order menu. "1 = all good" / "2 = something is wrong"
+ * keeps its meaning, so the Switch Case routes either script identically.
+ */
+function deliveryMenuPrompt(order: OrderRecord | null): string {
+  const item = order?.product_name ? ` of ${order.product_name}` : "";
+
+  return `If you have received your delivery${item} and it is in good
+    condition, press 1.
+
+    If you have not received it, or there is a problem with it, press 2.`;
+}
+
+function deliveryMenuRepeat(): string {
+  return `Sorry, we did not get your response.
+
+    If you have received your delivery, press 1.
+
+    If you have not received it, or there is a problem with it, press 2.`;
 }
 
 function orderConfirmedPrompt(): string {
-  return `Thank you for confirming your order.
+  return `Thank you for confirming.
 
-    Your order has been successfully confirmed and will be processed according to the delivery schedule.
+    Your delivery address is confirmed and your order will be processed as
+    scheduled.
 
-    Goodbye.`;
+    Thank you for choosing mjunction. Goodbye.`;
 }
 
 /**
- * The one closing for every "press 2", in both scripts.
+ * Closing for a press-2 on the order menu.
  *
- * Deliberately identical wording whichever menu the caller pressed 2 on and
- * whichever script they are in: at this point the only thing true of all four
- * cases is that a person will follow up. Anything more specific would be a
- * promise this function cannot keep — it does not know what the caller's
- * problem is, only that they have one.
+ * It tells the caller exactly what happens next and in what order, because
+ * "someone will get back to you" is the line every caller has been given
+ * before and none of them can act on. The WhatsApp link is named first
+ * because it is the path that lets them fix the address themselves; the
+ * callback is the stated fallback rather than an unexplained second promise.
+ *
+ * NOTE: nothing in either repo sends that WhatsApp message yet — see the
+ * README's "Outstanding: the WhatsApp hand-off" section. Until it does, the
+ * `issue_raised` recipient this produces is picked up from mjunction's
+ * escalations queue by an agent, which is the callback half of what the
+ * caller was just promised.
  */
-function escalationPrompt(): string {
-  return `For your assistance, we're connecting you with our team now.
+function orderIssuePrompt(): string {
+  return `Thank you for letting us know. Your request has been recorded.
 
-    One of our team members will call you shortly.`;
-}
+    You will shortly receive a message on WhatsApp with a link to update your
+    delivery address.
 
-// --- delivery-confirmation script -----------------------------------------
+    If we are unable to reach you on WhatsApp, our support team will call you.
 
-/**
- * Delivery welcome menu, on the same node as the order-confirmation welcome.
- * "Press 1 = received" / "press 2 = not received" — the digits keep their
- * "all good" / "something is wrong" meanings, so Exotel's Switch Case routes
- * a non-delivery to the same `issue` closing branch the order script uses.
- */
-function deliveryWelcomePrompt(order: OrderRecord | null): string {
-  if (!order) {
-    return `This is an automated call regarding the delivery of your recent order.
-
-      If you have received your delivery, please press 1.
-
-      If you have not received it yet, please press 2.`;
-  }
-
-  const greeting = order.customer_name
-    ? `Hello ${order.customer_name}.`
-    : "Hello.";
-  const from = order.company_name ? ` from ${order.company_name}` : "";
-  const item = order.product_name ? ` for ${order.product_name}` : "";
-
-  return `${greeting} This is an automated call${from} regarding the delivery of your order
-    ${spellReference(order.order_id)}${item}.
-
-    If you have received your delivery, please press 1.
-
-    If you have not received it yet, please press 2.`;
-}
-
-/**
- * Second-level menu, on the node the address prompt uses in the other script.
- * Having confirmed the parcel arrived, the caller now confirms the item
- * itself is right — and "press 2" raises an issue for an agent to pick up,
- * exactly as an address problem does on the order script.
- */
-function deliveryItemPrompt(order: OrderRecord | null): string {
-  if (!order?.product_name) {
-    return `Thank you.
-
-      If the item you received is correct and in good condition, please press 1.
-
-      If there is any problem with the item, please press 2 to report it.`;
-  }
-
-  return `Thank you.
-
-    Please confirm the item you received: ${order.product_name}.
-
-    If it is correct and in good condition, please press 1.
-
-    If there is any problem with the item, please press 2 to report it.`;
+    Thank you for choosing mjunction. Goodbye.`;
 }
 
 function deliveryConfirmedPrompt(): string {
-  return `Thank you for confirming your delivery.
+  return `Thank you for confirming.
 
-    Your delivery has been successfully confirmed and this order is now complete.
+    Your delivery has been confirmed and this order is now complete.
 
-    Goodbye.`;
+    Thank you for choosing mjunction. Goodbye.`;
+}
+
+/**
+ * Closing for a press-2 on the delivery menu. A missing or damaged delivery
+ * is not something a self-service link can fix, so this one promises the
+ * callback outright rather than the WhatsApp path.
+ */
+function deliveryIssuePrompt(): string {
+  return `Thank you for letting us know. Your issue has been recorded.
+
+    Our support team will call you shortly to resolve it.
+
+    Thank you for choosing mjunction. Goodbye.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -501,9 +556,10 @@ export default {
           {
             error: "Missing required step",
             hint:
-              "Point the applet at /dynamic-greeting/welcome (preferred, path-based — " +
-              "survives Exotel rewriting the query string) or ?step=welcome. " +
-              "Also valid: /passthru, /address, /done, /confirm, /issue, /goodbye.",
+              "Point the applet at /dynamic-greeting/greeting (the entry Greeting " +
+              "applet) or /dynamic-greeting/welcome (the menu Gather) — path-based, " +
+              "which survives Exotel rewriting the query string; ?step= still works. " +
+              "Also valid: /passthru, /done, /confirm, /goodbye, /issue, /escalate.",
             received: allParams,
           },
           { status: 400, headers: JSON_HEADERS },
@@ -559,47 +615,88 @@ export default {
       }
 
       // ------------------------------------------------------------------
-      // Gather applets — always 200 + JSON.
+      // The three call nodes, in the order a caller meets them: greeting,
+      // menu, closing. Every branch answers 200 — JSON for the Gather
+      // applets, text/plain for the Greeting one.
       // ------------------------------------------------------------------
       switch (step) {
-        case "welcome": {
+        // ------------------------------------------------------------------
+        // Node 1 of 3 — Greeting. Plays who is calling and why, collects
+        // nothing, then falls straight through to the menu. This is a
+        // *Greeting* applet, not a Gather, so it answers text/plain rather
+        // than the Gather JSON contract — see greet().
+        // ------------------------------------------------------------------
+        case "greeting":
+        case "greet":
+        case "intro": {
+          logCallStep({
+            callSid,
+            callerNumber,
+            orderId,
+            step: "greeting",
+            status: order ? "GREETING_SERVED" : "GREETING_SERVED_NO_ORDER",
+            appletHint: "greeting",
+          });
+
+          const response = greet(
+            isDelivery ? deliveryGreeting(order) : orderGreeting(order),
+          );
+
+          logEvent({
+            fn: "dynamic-greeting",
+            level: orderDegraded ? "warning" : "success",
+            event: "greeting_served",
+            message: order
+              ? `Greeting served for resolved order (${flow})`
+              : `Greeting served with NO order resolved (generic wording, ${flow})`,
+            method: req.method,
+            url: req.url,
+            params: allParams,
+            status: 200,
+            callSid,
+            callerNumber,
+            orderId,
+            step,
+            durationMs: Date.now() - startedAt,
+          });
+
+          return response;
+        }
+
+        // ------------------------------------------------------------------
+        // Node 2 of 3 — the only menu. One question, one keypress, done.
+        //
+        // `address` is accepted as an alias purely for the migration window:
+        // an Exotel flow still wired the old way routes a welcome-menu "1"
+        // here, and serving the same menu again is strictly better than a
+        // 400 that drops the caller — they hear the question twice, press
+        // once more, and still land on the correct closing. Remove the alias
+        // once the flow no longer has that node (see the README section
+        // "Migrating from the two-menu flow").
+        // ------------------------------------------------------------------
+        case "welcome":
+        case "menu":
+        case "address": {
           logCallStep({
             callSid,
             callerNumber,
             orderId,
             step: "welcome",
-            // "SERVED" not "PLAYED": we returned a prompt, but whether the
-            // caller actually heard it depends on the applet type, which only
-            // Exotel knows. Claiming PLAYED made silent calls look successful.
-            status: order ? "WELCOME_SERVED" : "WELCOME_SERVED_NO_ORDER",
+            status: order ? "MENU_SERVED" : "MENU_SERVED_NO_ORDER",
             appletHint,
           });
 
           const response = isDelivery
-            ? gather(
-              deliveryWelcomePrompt(order),
-              `We did not receive a valid response.
-
-               If you have received your delivery, please press 1.
-
-               If you have not received it yet, please press 2.`,
-            )
-            : gather(
-              welcomePrompt(order),
-              `We did not receive a valid response.
-
-               To confirm your order, please press 1.
-
-               To report an issue with this order, please press 2.`,
-            );
+            ? gather(deliveryMenuPrompt(order), deliveryMenuRepeat())
+            : gather(orderMenuPrompt(order), orderMenuRepeat());
 
           logEvent({
             fn: "dynamic-greeting",
             level: orderDegraded ? "warning" : "success",
-            event: "welcome_served",
+            event: "menu_served",
             message: order
-              ? `Welcome prompt served for resolved order (${flow})`
-              : `Welcome prompt served with NO order resolved (generic wording, ${flow})`,
+              ? `Menu served for resolved order (${flow})`
+              : `Menu served with NO order resolved (generic wording, ${flow})`,
             method: req.method,
             url: req.url,
             params: allParams,
@@ -614,80 +711,33 @@ export default {
           return response;
         }
 
-        case "address": {
-          // Reached only via the welcome Gather's "confirm" branch (Exotel's
-          // own Switch Case routes on the collected digit and only calls
-          // this URL for a "1" press) — the order-confirmation digit is
-          // implied by having reached this step at all, not something to
-          // read back from the request. Exotel does not echo a prior digit
-          // into this flow's requests (confirmed by inspecting the raw
-          // payload — no digit param of any kind is present).
-          logCallStep({
-            callSid,
-            callerNumber,
-            orderId,
-            step: "address",
-            userInput: digits,
-            status: isDelivery ? "DELIVERY_ITEM_PROMPT_SERVED" : "ADDRESS_PROMPT_SERVED",
-            appletHint,
-          });
-
-          const response = isDelivery
-            ? gather(
-              deliveryItemPrompt(order),
-              `We did not receive a valid response.
-
-               If the item you received is correct and in good condition, please press 1.
-
-               If there is any problem with the item, please press 2.`,
-            )
-            : gather(
-              addressPrompt(order),
-              `We did not receive a valid response.
-
-               If your delivery address is correct, please press 1.
-
-               If there is an issue with your delivery address, please press 2.`,
-            );
-
-          logEvent({
-            fn: "dynamic-greeting",
-            level: orderDegraded ? "warning" : "success",
-            event: "address_served",
-            message: isDelivery
-              ? "Delivery item prompt served"
-              : "Address prompt served",
-            method: req.method,
-            url: req.url,
-            params: allParams,
-            status: 200,
-            callSid,
-            callerNumber,
-            orderId,
-            step,
-            durationMs: Date.now() - startedAt,
-          });
-
-          return response;
-        }
-
-        // Each of these is reached via a distinct Switch Case branch in the
-        // configured Exotel flow, so the outcome is implied entirely by
-        // which URL was called — sent explicitly to update-order-status
-        // rather than derived from a DTMF digit that this flow never
-        // forwards (see the "address" case comment above).
+        // ------------------------------------------------------------------
+        // Node 3 of 3 — the two closings. Each is reached from exactly one
+        // Switch Case branch of the menu above, so *which URL Exotel called
+        // is itself the keypress*: `done` can only be a "1" and `issue` can
+        // only be a "2". That is why both the outcome and the DTMF digit are
+        // sent explicitly below rather than read off the request — Exotel
+        // does not echo the collected digit into the branch it routes to
+        // (confirmed against a live payload; no digit param of any kind is
+        // present), so `readDigits` is empty here and is used only as an
+        // override for the rare provider/config that does send one.
+        //
+        // Recording the digit matters: before this, every real IVR call
+        // finalized with `dtmf_response = null`, so the admin panel had a
+        // DTMF column that was permanently empty for anything but a mock
+        // call.
+        // ------------------------------------------------------------------
         case "done":
         case "goodbye":
         case "confirm": {
-          // Reached only via the second Gather's "correct" branch — the
-          // address is right (order script) or the delivered item is right
-          // (delivery script).
+          const pressed = digits || CONFIRM_DIGIT;
+
           logCallStep({
             callSid,
             callerNumber,
             orderId,
             step: "done",
-            userInput: digits,
+            userInput: pressed,
             status: isDelivery ? "DELIVERY_CONFIRMED" : "ADDRESS_CONFIRMED",
             appletHint,
           });
@@ -702,6 +752,7 @@ export default {
               callSid,
               callerNumber,
               outcome: "confirmed",
+              dtmf: pressed,
             });
           }
 
@@ -730,26 +781,21 @@ export default {
           return response;
         }
 
-        // Every "press 2" in either script ends here — the welcome menu's
-        // branch and the second menu's branch alike.
-        //
-        // The second menu's branch used to go to a Greeting + Connect applet
-        // that live-transferred the caller. That transfer is gone: both
-        // branches now play the same escalation message and raise an issue for
-        // an agent to pick up from the escalations queue. Because both mean
-        // the same thing, they share one Exotel node — see the README's flow
-        // diagram. `escalate` / `address-issue` are accepted as aliases so a
-        // flow wired to a separate node for the second menu also works
-        // without needing this function redeployed in lockstep.
+        // The menu's "press 2", in either script. `escalate` /
+        // `address-issue` stay as aliases so a flow wired to a separately
+        // named node keeps working without redeploying this function in
+        // lockstep.
         case "issue":
         case "escalate":
         case "address-issue": {
+          const pressed = digits || ISSUE_DIGIT;
+
           logCallStep({
             callSid,
             callerNumber,
             orderId,
             step: "done",
-            userInput: digits,
+            userInput: pressed,
             status: isDelivery ? "DELIVERY_ISSUE_RAISED" : "ORDER_ISSUE_RAISED",
             appletHint,
           });
@@ -763,10 +809,13 @@ export default {
               // moves to `issue_raised` and an agent takes it from the
               // escalations queue.
               outcome: "issue_raised",
+              dtmf: pressed,
             });
           }
 
-          const response = speak(escalationPrompt());
+          const response = speak(
+            isDelivery ? deliveryIssuePrompt() : orderIssuePrompt(),
+          );
 
           logEvent({
             fn: "dynamic-greeting",
@@ -774,7 +823,7 @@ export default {
             event: "closing_served",
             message: isDelivery
               ? "Escalation message served (delivery issue)"
-              : "Escalation message served (order issue)",
+              : "Escalation message served (address change requested)",
             method: req.method,
             url: req.url,
             params: allParams,
